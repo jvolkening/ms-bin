@@ -1,0 +1,18 @@
+#!/usr/bin/perl
+
+use strict;
+use warnings;
+
+use MS::Parser::PepXML;
+use Data::Dumper;
+
+
+my $p = MS::Parser::PepXML->new;
+$p->load( $ARGV[0] );
+while (my $q = $p->next_query) {
+    my $tag = $q->{spectrum};
+    my $top_hit = $q->{results}->[0]->{hits}->[0]->{peptide};
+    next if (! defined $top_hit);
+    $tag .= ":$top_hit";
+    print $tag, "\n";
+}

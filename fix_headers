@@ -1,0 +1,125 @@
+#!/usr/bin/perl 
+
+eval 'exec /usr/bin/perl  -S $0 ${1+"$@"}'
+    if 0; # not running under some shell
+
+use strict;
+use warnings;
+use File::Copy qw/move/;
+use Cwd qw/getcwd abs_path/;
+use File::Basename qw/fileparse/;
+use Getopt::Long;
+
+my $raw_suff = 'mzML';
+my $raw_fn;
+my $raw_dir;
+
+my $here = abs_path( getcwd() );
+
+GetOptions(
+    'raw_suff=s' => \$raw_suff,
+    'raw_file=s' => \$raw_fn,
+    'raw_dir=s'  => \$raw_dir,
+);
+
+if (defined $raw_dir) {
+    $raw_dir = abs_path($raw_dir);
+}
+
+if (defined $raw_fn) {
+    die "Filename given but not found\n" if (! -e $raw_fn);
+    $raw_fn = abs_path($raw_fn);
+    if ($raw_fn =~ /.*[\/\\]?(.+)\.(mzML(\.b?gz)?)$/) {
+        $raw_fn     = $1;
+        $raw_suff = $2;
+    }
+    else {
+        die "unknown file extension";
+    }
+}
+
+my @extensions = ('', '.gz');
+my $fix_raw = defined $raw_fn || defined $raw_dir;
+
+my @files = @ARGV;
+
+for my $file (@files) {
+    my $summary_xml = abs_path($file);
+    open my $out, '>', $file . '.tmp';
+    open my $in, '<', $file;
+    my $headers_fixed = 0;
+    my $base_fixed    = 0;
+    my $suff_fixed    = 0;
+    while (my $line = <$in>) {
+        if (! $headers_fixed) {
+            $headers_fixed += $line =~ s/(?<=summary_xml=\")[^\"]+/$summary_xml/;
+        }
+        if ($fix_raw & $line =~ /<msms_run_summary/) {
+            my $base;
+            my $suff;
+            if ($line =~ /(?<=base_name=\")([^\"]+)/) {
+                $base = $1;
+                $base =~ s/.*[\/\\]//;
+            }
+            if ($line =~ /(?<=raw_data=\")([^\"]+)/) {
+                $suff = $1;
+                $suff =~ s/^\.//;
+            }
+            die "failed to match basename and suffix\n"
+                if (! defined $base || ! defined $suff);
+            $suff = $raw_suff // $suff;
+            if (defined $raw_fn) {
+                $base_fixed += $line =~ s/(?<=base_name=\")([^\"]+)/$raw_fn/;
+                $suff_fixed += $line =~ s/(?<=raw_data=\")([^\"]+)/\.$suff/;
+            }
+            else { # $raw_dir should be defined here
+                my @matches = find_path("$base.$suff", $raw_dir);
+                die "failed to find raw file $base.$suff in search path\n"
+                    if (scalar(@matches) < 1);
+                die "found multiple exact matches for $base.$suff\n"
+                    if (scalar(@matches) > 1);
+                my $actual = $matches[0];
+                $actual =~ s/\.[^\.]+$//;
+                $base_fixed += ($line =~ s/(?<=base_name=\")[^\"]+/$actual/);
+                $suff_fixed += ($line =~ s/(?<=raw_data=\")[^\"]+/\.$suff/);
+            }
+        }
+        print {$out} $line;
+    }
+    close $out;
+    close $in;
+    chdir $here;
+    move("$file.tmp" => $file);
+    print "$file\n";
+    print "\t$headers_fixed headers fixed\n";
+    print "\t$base_fixed bases fixed\n";
+    print "\t$suff_fixed suffices fixed\n";
+}
+
+sub find_path {
+
+    my ($fn, $dir) = @_;
+    my ($wanted,$pre,$suff) = fileparse($fn);
+
+    my $curr_dir = abs_path( getcwd() );
+    chdir $dir;
+
+    my @files = glob '*';
+
+    my @found = ();
+    for (@files) {
+        next if ($_ =~ /^\./);
+        if (-d $_) {
+            my @paths = find_path($fn,$_);
+            push @found, @paths;
+        }
+        else {
+            my ($name,$dir,$suff) = fileparse($_);
+            push @found, abs_path($_) if ($name eq $wanted);
+        }
+    }
+
+    chdir $curr_dir;
+    return @found;
+
+}

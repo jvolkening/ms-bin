@@ -1,0 +1,1044 @@
+#!/usr/bin/perl
+
+##############################################################################
+####
+#### Original author : Madhu Sudan Hari
+####                   UW-Biotechnology Center
+####
+#### Heavily modified by : Jeremy Volkening
+####                       UW Biotechnology Center
+####
+#### Current version: 5.02a
+#### Last modified  : 02 May 2014
+####
+#############################################################################
+
+# a struct-like object to manage peptide tables
+package pep_entry;
+use Class::Struct;
+struct ( 'pep_entry'=> {
+    decoy             => '$',
+    charge            => '$',
+    seq               => '$',
+    calc_neutral_mass => '$',
+    ion_score         => '$',
+    error_ppm         => '$',
+} );
+
+##############################################################################
+
+package main;
+
+use strict;
+use warnings;
+use autodie qw/:all/;
+use Config::Tiny;
+use File::Basename qw/fileparse/;
+use File::Temp qw/tempfile/;
+use Getopt::Long;
+use List::Util qw/sum first/;
+use Pod::Usage;
+use POSIX qw/floor/;
+use XML::Twig;
+
+our $PROGRAM = 'fdr';
+our $VERSION = '5.02a';
+
+# Set default params
+
+# enums/bools
+my $search_engine    = 'mascot';  # mascot|sequest|omssa 
+my $N15              = 0;  # BOOL true = 15N false = 14N
+my $target_FDR       = 0.01;
+my $max_error        = 30;
+my $min_score        = 10;
+my $max_score        = 100;
+my $min_z            = 2;
+my $max_z            = 5;
+my $rev_tag          = 'REV';
+my $score_step       = 1;
+my $step_ppm         = 0.5;
+my $use_pit          = 0;
+my $file_mods;
+my $file_in ;
+my $file_db ;
+my $emulate          = 0;
+my $h                = 0;
+my $fix_fdr          = 1;
+my $fdr_all          = 1;
+my $fix_paths        = 0;
+my $verbose          = 0;
+my $fn_peptable;
+my $fn_cutoffs;
+my $fn_census;
+my $fn_sep;
+my $fn_nonsep;
+
+GetOptions(
+    'search_engine=s' => \$search_engine,
+    '15N'             => \$N15,
+    'target_fdr=f'    => \$target_FDR,
+    'max_err=f'       => \$max_error,
+    'min_score=f'     => \$min_score,
+    'max_score=f'     => \$max_score,
+    'min_z=i'         => \$min_z,
+    'max_z=i'         => \$max_z,
+    'decoy_tag=s'     => \$rev_tag,
+    'score_step=f'    => \$score_step,
+    'err_step=f'      => \$step_ppm,
+    'mods:s'          => \$file_mods,
+    'input=s'         => \$file_in,
+    'db=s'            => \$file_db,
+    'emulate'         => \$emulate,
+    'fix_fdr=i'       => \$fix_fdr,
+    'use_all=i'       => \$fdr_all,
+    'fix_paths'       => \$fix_paths,
+    'help'            => \$h,
+    'verbose'         => \$verbose,
+    'peptide_table:s' => \$fn_peptable,
+    'cutoff_table:s'  => \$fn_cutoffs,
+    'filtered:s'      => \$fn_nonsep,
+    'filt_by_charge:s'=> \$fn_sep,
+    'for_census:s'    => \$fn_census,
+    'use_pit=i'       => \$use_pit,
+) or die "error parsing command options";
+
+
+# check intput parameters
+pod2usage( -verbose => 2) if ($h);
+my $m = 'unrecognized search engine';
+pod2usage( -msg => $m ) if ($search_engine !~ /^(?:mascot|sequest|omssa)$/);
+$m = 'failed to open mods file';
+pod2usage( -msg => $m ) if (defined $file_mods && ! -r $file_mods);
+$m = 'failed to open input file';
+pod2usage( -msg => $m ) if (! -r $file_in);
+$m = 'failed to open database file';
+pod2usage( -msg => $m ) if (! -r $file_db);
+
+my ($file_name, $path) = fileparse($file_in);
+my $mods = {};
+if (defined ($file_mods)) {
+    $mods = Config::Tiny->read($file_mods)
+        or die "failed to parse $file_mods";
+}
+my $N14_mods = $mods->{'14N'} // {};
+my $N15_mods = $mods->{'15N'} // {};
+
+# force fixed calculation if non-unique peptides used
+$fix_fdr = 1 if ($fdr_all);
+
+# package variables
+my @peptable;
+my %annots;
+my $cutoff_score;
+my $mass_tol;
+my @sep_optima;
+my $score_string;
+my $protein_string;
+my $target_total;
+my $decoy_total;
+my $PIT;
+
+# If "--emulate" is specified, certain quirks of the original software are
+# replicated. The purpose is to yield identical output to the old software.
+# This is useful mainly for testing and for backward compatibility
+if ($emulate) {
+    $max_z = 3 if ($max_z > 3);
+    $fix_fdr   = 0;
+    $fix_paths = 0;
+    my ($base_name) = $file_name =~ /(\w+)/; # remove suffix
+    $fn_peptable  = "$path/$base_name\_peptable.tsv";
+    $fn_cutoffs   = "$path/$base_name\_chargesep.tsv";
+    $fn_sep       = "$path/$base_name\_filtered_bycharge.pep.xml";
+    $fn_nonsep    = "$path/$base_name\_filtered.pep.xml";
+    $fn_census    = "$path/$base_name\_filtered_bycharge_reformattedmods.pep.xml";
+}
+
+run();
+
+exit;
+
+
+
+##############################################################################
+# this subroutine sets the proper values and calls the 
+# appropriate processing callback based on parameters given
+sub run {
+
+    warn "Loading annotations...\n" if ($verbose);
+    %annots = read_db($file_db); # populate %annots with ID => annot
+
+    # in original script, target FDR is multiplied by 1.1;
+    # this behavior is retained for now, but WHY?????????
+    my $hold_FDR = $target_FDR;
+    $target_FDR *= 1.1;
+
+    $score_string = $search_engine eq 'mascot'  ? "ionscore" #Mascot
+                  : $search_engine eq 'sequest' ? "xcorr"    #Sequest
+                                                : "expect";  #OMSSA
+
+    $protein_string = $search_engine eq 'omssa' ? "protein_descr" : "protein";
+
+    # do the actual processing
+    process_pepXML();
+
+    # restore true target FDR (see above)
+    $target_FDR = $hold_FDR;
+
+} 
+
+
+##############################################################################
+#  Function that computes FDR on pepXML files
+sub process_pepXML {
+
+    my $twig = new XML::Twig(
+        twig_handlers => {
+            spectrum_query => \&handle_spectrum_query
+        }
+    );
+    
+    # if requested, open and print peptide table (as previously defined)
+    if (defined $fn_peptable) {
+        open my $fh, '>', $fn_peptable;
+        print {$fh} join( "\t", qw/
+            ProteinID
+            Observed_Mass
+            Assumed_Charge
+            Sequence
+            Calculated_Neutral_Mass
+            Mass_Error
+            IonScore
+            Fixed_Error
+            Error_PPM
+        / ), "\n";
+        $twig->{fh_peptable} = $fh;
+    }
+
+    # populate the pep_table - see &handle_spectrum_query sub
+    warn "Loading peptide data...\n" if ($verbose);
+    eval { $twig->parsefile( $file_in ) };
+    die "Error caught: $@ \n" if ($@);
+
+    close $twig->{fh_peptable} if (defined $fn_peptable);
+
+    if ($use_pit) {
+
+        $target_total = grep {$_->decoy} @peptable;
+        $decoy_total  = @peptable - $target_total;
+        my @decoy_scores = sort {$a <=> $b} map {$_->ion_score} grep {$_->decoy} @peptable;
+        my $pit_cutoff = $decoy_scores[int(scalar(@decoy_scores)*95/100)];
+        my $decoy_below  = grep { $_->decoy && $_->ion_score < $pit_cutoff} @peptable;
+        my $target_below = grep {!$_->decoy && $_->ion_score < $pit_cutoff} @peptable;
+        $PIT = $target_below/$decoy_below;
+        warn "PIT: $PIT\n";
+
+    }
+
+    # optimize mass-error cut-off
+    warn "calculating combined charge optimum mass-tolerance and cut-off score...\n" if ($verbose);
+    my $fdr_optimum = FDR_noncharge(); 
+    $cutoff_score = $fdr_optimum->{score};
+    $mass_tol = $fdr_optimum->{error};
+
+    warn "\toptimum mass tolerance: $mass_tol\n" if ($verbose);
+    warn "\toptimum cutoff score:   $cutoff_score\n" if ($verbose);
+
+    warn "calculating separated charge optimum mass-tolerance and cut-off score...\n" if ($verbose);
+    @sep_optima = FDR_separate_charges();
+
+    # export the charge state separation list if requested
+    if (defined $fn_cutoffs) {
+        open my $fh_cutoffs, '>', $fn_cutoffs;
+        print {$fh_cutoffs} join("\t", qw/
+            FDR
+            Nfwd
+            Nrev
+            Score
+            Charge
+            Error
+        / ), "\n";
+        print {$fh_cutoffs} join("\t", (
+            $fdr_optimum->{FDR},
+            $fdr_optimum->{fwd_count},
+            $fdr_optimum->{rev_count},
+            $fdr_optimum->{score},
+            'ALL',
+            $fdr_optimum->{error},
+        ) ), "\n";
+        for my $result (@sep_optima) {
+            print {$fh_cutoffs} join("\t", (
+                $result->{FDR},
+                $result->{fwd_count},
+                $result->{rev_count},
+                $result->{score},
+                $result->{charge},
+                $result->{error},
+            ) ), "\n";
+        }
+        close $fh_cutoffs;
+    }
+
+    # write filtered data without charge sep
+    if (defined $fn_nonsep) {
+
+        warn "printing all-charge pepXML\n" if ($verbose);
+        open my $xml_out , '>', $fn_nonsep;
+        my $old_fh = select( $xml_out );
+        my $t = XML::Twig->new(
+            twig_handlers => { spectrum_query => \&filter_noncharge },
+            pretty_print => 'indented',
+            error_context => 1,
+            keep_encoding => 1,
+        );  
+        $t->parsefile( $file_in );
+        close $xml_out;
+        select( $old_fh );
+
+    }
+
+    # filter data with charge separation
+    if (defined $fn_sep) {
+
+        warn "printing by-charge pepXML\n" if ($verbose);
+        open my $xml_out, '>', $fn_sep;
+        my $old_fh = select( $xml_out );
+        my $t = XML::Twig->new(
+            twig_handlers => {spectrum_query => \&filter_by_charge},
+            pretty_print => 'indented',
+            error_context => 1,
+            keep_encoding => 1,
+        );
+        $t->parsefile( $file_in );
+        close $xml_out;
+        select( $old_fh );
+
+    }
+
+    # reformat output for CENSUS (add mods, fix paths, ec)
+    if (defined $fn_census) {
+
+        open my $xml_out, '>', $fn_census;
+        my $old_fh = select( $xml_out);
+        my $t = XML::Twig->new(
+            twig_handlers => {
+                search_hit => \&_reformat,
+            },
+            start_tag_handlers => {
+                msms_run_summary       => \&_fix_paths,
+                msms_pipeline_analysis => \&_fix_paths,
+                search_summary         => \&_fix_paths,
+            },
+            pretty_print => 'indented',
+            error_context => 1,
+            keep_encoding => 1,
+        );
+        my $filt_file = $fn_sep // $fn_nonsep // $file_in;
+        $t->parsefile( $filt_file );
+        close $xml_out;
+        select( $old_fh );
+
+    }
+
+}
+
+sub _fix_paths {
+
+    return if (! $fix_paths);
+
+    my ($t,$e,) = @_;
+    for (qw/base_name summary_xml/) {
+        if (defined $e->att($_)) {
+            my ($name,$path) = fileparse( $e->att($_) );
+            $e->set_att($_ => $name);
+        }
+    }
+    return 1;
+}
+
+
+##############################################################################
+# Reformats suitable input for CENSUS
+sub _reformat {
+
+    my ($twig, $search_hit) = @_;
+    my $sequence = $search_hit->att( 'peptide' );
+
+    # change all scores to 'xcorr'
+    for my $score ($search_hit->children("search_score")) {
+        my $name = $score->att('name');
+        $score->set_att('name' => 'xcorr')
+            if ($name eq 'ionscore' && ! $emulate);
+    }
+
+    my $mod_info = $search_hit->first_child('modification_info');
+    if (defined $mod_info) {
+
+        my @mods;
+
+        # check for N-term mods
+        push( @mods, [0, $mod_info->att('mod_nterm_mass')] )
+            if (defined $mod_info->att('mod_nterm_mass'));
+  
+        # check for other mods
+        push( @mods, [$_->att('position'), $_->att('mass')] )
+            for ($mod_info->children('mod_aminoacid_mass'));
+            
+        @mods = sort {$a->[0] <=> $b->[0]} @mods;
+        my $adjust_pos = 0;
+        for (@mods) {
+            my ($pos,$mass) = @{ $_ };
+            $pos += $adjust_pos;
+            my $symbol = $N15 ? $N15_mods->{$mass} : $N14_mods->{$mass};
+            if (defined $symbol) {
+                substr($sequence, $pos, 0) = $symbol; # insert symbol
+                $adjust_pos += length($symbol);
+            }
+        }
+        $search_hit->set_att('peptide' => $sequence);
+        $search_hit->cut_children('modification_info');
+    }
+    $twig->flush();
+    
+}
+
+##############################################################################
+# filter original pepXML based on charge-state FDR
+sub filter_by_charge {
+
+    my ($twig, $spectrum_query) = @_;
+    my $charge = $spectrum_query->att('assumed_charge');
+    $charge = $max_z if ($charge > $max_z);
+    my ($score,$massT);
+    my $result_count = 0;
+    my @results = $spectrum_query->children('search_result');
+    RESULT:
+    for my $result (@results) {
+        if ($charge < $min_z) {
+            warn "WARN: discarding peptide (charge < min_z)\n";
+            last RESULT;
+        }
+        my @hits = $result->children('search_hit');
+        if ( @hits ) {
+
+            my $keepit;
+
+            for my $result (@sep_optima) {
+                $keepit = $result;
+                if ($charge == $keepit->{charge}) { 
+                    $score = $keepit->{score};
+                    $massT = $keepit->{error};
+                }
+            }
+            if ($charge > $max_z) {
+                $keepit = $sep_optima[$max_z];
+                $score = $keepit->{score};
+                $massT = $keepit->{error};
+            }
+            if (! defined $score || ! defined $massT) {
+                warn "WARN: missing cutoffs for charge $charge\n";
+                $result->delete;
+                next RESULT;
+            }
+            my $hit_count = 0;
+            HIT:
+            for my $child (@hits) {
+
+                # don't keep decoy hits
+                if ($child->att('protein') =~ /^$rev_tag/) {
+                    $child->delete();
+                    next HIT;
+                }
+
+                if ($child->att('hit_rank') > 1) {
+                    $child->delete();
+                    next HIT;
+                }
+
+                my $err = $child->att('massdiff')
+                    - floor( $child->att('massdiff')+0.5 )*1.0033546;
+                my $errppm = $err / $child->att('calc_neutral_pep_mass') * 1000000;
+                my @score_array = $child->children('search_score');
+                my $s;
+                for my $type (@score_array) {
+                    if ($type->att('name') eq $score_string) {
+                        $s = $type->att('value'); 
+                    }
+                }
+                # here is the actual filtering
+                if( ($s < $score) || (abs($errppm) > $massT) ) {
+                    $child->delete();
+                    next HIT;
+                }
+                ++$hit_count;
+            }
+            if (! $hit_count) {
+                $result->delete;
+                next RESULT;
+            }
+            ++$result_count;
+        }
+    }
+    if ($result_count) {
+        $twig->flush();
+    }
+    else {
+        $spectrum_query->delete();
+    }
+}
+
+
+##############################################################################
+# non-separate charge filtering
+sub filter_noncharge {
+
+    my ($twig, $spectrum_query) = @_;
+
+    my $result_count = 0;
+    my @results = $spectrum_query->children('search_result');
+    RESULT:
+    for my $result (@results) {
+        my @hits = $result->children('search_hit');
+        my $hit_count = 0;
+        HIT:
+        for my $hit ( @hits ) {
+
+            # don't keep decoy hits
+            if ($hit->att('protein') =~ /^$rev_tag/) {
+                $hit->delete();
+                next HIT;
+            }
+
+            if ($hit->att('hit_rank') > 1) {
+                $hit->delete();
+                next HIT;
+            }
+
+
+            my $err = $hit->att('massdiff')
+                - floor( $hit->att('massdiff')+0.5 )*1.0033546;
+            my $errppm = $err / $hit->att('calc_neutral_pep_mass') * 1000000;
+            my @score_array = $hit->children('search_score');
+            my $score;
+            for my $temp (@score_array) {
+                if ($temp->att('name') eq $score_string) {
+                    $score = $temp->att('value');
+                }
+            }
+
+            # do the actual filtering
+            if( abs($errppm) > $mass_tol || $score < $cutoff_score ) {
+                $hit->delete();
+                next HIT;
+            }
+            ++$hit_count;
+        }
+        if (! $hit_count) {
+            $result->delete;
+            next RESULT;
+        }
+        ++$result_count;
+    }
+
+    if ($result_count) {
+        $twig->flush();
+    }
+    else {
+        $spectrum_query->delete();
+    }
+}
+
+
+##############################################################################
+# populate @peptable
+sub handle_spectrum_query {
+
+    my ($twig, $spectrum_query) = @_;
+
+    # defined if printout is requested
+    my $fh_peptable = $twig->{fh_peptable};
+
+    my $search_result = $spectrum_query->first_child( 'search_result' );
+    if (defined $search_result) {
+
+        my $entry = new pep_entry;
+        
+        # get the precursor neutral mass and assumed charge
+        my $id  =   $spectrum_query->att('spectrum'); #keep +0
+        my $obs_mass  =   $spectrum_query->att('precursor_neutral_mass')+0 ; #keep +0
+        $entry->charge(   $spectrum_query->att('assumed_charge'        )+0 ); #keep +0
+
+        # find the search hit with hit_rank 1 
+        my @search_hits = $search_result->children('search_hit');
+        if (! @search_hits) {
+            #warn "no search_hit elements found for $id";
+            return;
+        }
+        my $top_hit = first {$_->att('hit_rank') == 1} @search_hits;
+        die "error parsing pepXML: no top hit found" if (! defined $top_hit);
+
+        # get the peptide, protein_ID, calculated neutral mass, mass error from the top hit
+        $entry->seq(               $top_hit->att( 'peptide' )                );
+        $entry->calc_neutral_mass( $top_hit->att( 'calc_neutral_pep_mass')+0 ); #keep +0
+        my $mass_error =           $top_hit->att( 'massdiff' )+0 ; #keep +0
+        my $prot_id    =           $top_hit->att( $protein_string ) ;
+        $entry->decoy( ($prot_id =~ /$rev_tag/) ? 1 : 0 );
+
+        # get the search score
+        my @scores = $top_hit->children('search_score');
+        my $score = first {$_->att('name') eq $score_string} @scores;
+        die "error parsing pepXML: no score found" if (! defined $score);
+        $entry->ion_score( $score->att('value')+0 ); #keep +0
+
+        # the fixed_error reflects how far from the predicted isotope
+        # mass the error actually is.
+        my $rnd_Da_err = floor( $mass_error + 0.5 );
+        my $fixed_error = $mass_error - $rnd_Da_err*1.0033548 ;
+
+        # convert error to PPM
+        $entry->error_ppm(
+            $fixed_error / $entry->calc_neutral_mass * 1000000
+        );
+
+        my $annot = $annots{$prot_id} // '';
+
+        push @peptable, $entry;
+
+        if (defined $fh_peptable) {
+            print {$fh_peptable} join( "\t", (
+                $prot_id,
+                $obs_mass,
+                $entry->charge,
+                $entry->seq,
+                $entry->calc_neutral_mass,
+                $mass_error,
+                $entry->ion_score,
+                $fixed_error,
+                $entry->error_ppm,
+                $annot,
+            ) ), "\n"; 
+        }
+    }
+    else { die "Bad pepXML format" }
+    $twig->purge();
+}
+
+
+##############################################################################
+# FDR is calculated - this needs some serious scrutiny - code is perhaps not
+# acting as intended !!
+sub calculate_FDR {
+
+    my @peps = @_;
+    my (@rev, @fwd) = ();
+
+    for my $pep (@peps) {
+        my $array_ref = $pep->decoy ? \@rev : \@fwd;
+        push @{$array_ref}, ($pep->seq, $pep->calc_neutral_mass);
+    }
+
+    # Note : only unique peptide/neutral mass are used - the expected mass for
+    # each peptide is retained during the process to distinguish peptides with
+    # different PTMs (this is easier than manipulating a string containing
+    # modifications)
+
+    # Jeremy: PROBLEM - identical peptides will be collapsed here but neutral
+    # mass may not - this is probably not what was intended
+    my %rev    = map { $_ => 1 } @rev;
+    my %fwd    = map { $_ => 1 } @fwd;
+    my $numrev = scalar keys %rev;
+    my $numfwd = scalar keys %fwd;
+    
+    my $FDR = $numfwd > 0 ? $numrev/$numfwd : -1;
+
+    my $result = {
+        'FDR' => $FDR,
+        'fwd_count' => $numfwd,
+        'rev_count' => $numrev,
+    };
+
+    return $result;
+
+}
+
+
+##############################################################################
+# FDR is calculated - this is (I believed) fixed to act as intended
+sub calculate_FDR_fixed {
+
+    my @peps = @_;
+
+    my ($numfwd,$numrev) = (0,0);
+
+    if ($fdr_all) {
+
+        for my $pep (@peps) {
+            my $count_ref = $pep->decoy ? \$numrev : \$numfwd;
+            ${$count_ref} += 1;
+        }
+
+    }
+    else {
+
+        # use UNIQUE peptide/neutral mass (perhaps should be discussed)
+        my (%rev, %fwd) = ();
+        for my $pep (@peps) {
+            my $hash_ref = $pep->decoy ? \%rev : \%fwd;
+            $hash_ref->{ $pep->seq . ':' . $pep->calc_neutral_mass } = 1;
+        }
+        $numrev = scalar keys %rev;
+        $numfwd = scalar keys %fwd;
+    }
+
+    my $FDR = $numfwd > 0 ? $numrev/$numfwd : -1;
+
+    # correct for calculated PIT if asked
+    if ($use_pit) {
+        #my $PIT = ($target_total - $numfwd)/($decoy_total - $numrev);
+        $FDR *= $PIT;
+    }
+    
+    my $result = {
+        'FDR' => $FDR,
+        'fwd_count' => $numfwd,
+        'rev_count' => $numrev,
+    };
+
+    return $result;
+
+}
+
+
+##############################################################################
+# The cut-off score and allowable mass tolerance are computed charge wise.
+# Charge states of 3 and above are considered together. 
+sub FDR_separate_charges {
+
+    my @best_combined;
+    my $best_count = 0;
+    my $thresh_error = $max_error;
+
+    while ($thresh_error > 0) {
+
+        my @filt_by_err = grep {abs($_->error_ppm) <= $thresh_error} @peptable;
+
+        my %grouped;
+        $grouped{$_} = [] for ($min_z..$max_z);
+        for (@filt_by_err) {
+            my $charge_group = $_->charge > $max_z ? $max_z : $_->charge;
+            push @{ $grouped{$charge_group} }, $_;
+        }
+
+        my @results;
+
+        CHARGE:
+        for my $z (keys %grouped) {
+
+            next CHARGE if (@{ $grouped{$z} } < 1);
+
+            my $thresh_score = $min_score;
+
+            SCORE:
+            while ($thresh_score <= $max_score) {
+                
+                my @filt_by_all = grep {$_->ion_score >= $thresh_score} @{ $grouped{$z} };
+
+                # append results
+                my $result = $fix_fdr ? calculate_FDR_fixed( @filt_by_all )
+                                      : calculate_FDR(       @filt_by_all );
+                my $fdr = $result->{FDR};
+                if ($fdr < 0) {
+                    warn "no more forward hits, bailing\n";
+                    last SCORE
+                }
+
+                if ($fdr <= $target_FDR) {
+
+                    $result->{score}  = $thresh_score;
+                    $result->{error}  = $thresh_error;
+                    $result->{charge} = $z;
+                    push @results, $result;
+                    last SCORE;
+
+                }
+                $thresh_score += $score_step;
+
+            } 
+
+        }
+        my $fwd_count = sum( map{ $_->{fwd_count} } @results );
+        if ($fwd_count > $best_count) {
+            @best_combined = @results;
+            $best_count = $fwd_count;
+        }
+
+        $thresh_error -= $step_ppm;
+
+    }
+
+    die "Unable to achieve target FDR for charge-separated search"
+        if (! @best_combined);
+
+    @best_combined = sort {$a->{charge} <=> $b->{charge}} @best_combined;
+    return @best_combined;
+
+}
+
+
+##############################################################################
+# compute optimum FDR cutoffs without charge-state separation
+sub FDR_noncharge {
+
+    my $best_result;
+    my $thresh_error = $max_error;
+
+    while ($thresh_error > 0) {
+
+        my @filt_by_err = grep {abs($_->error_ppm) <= $thresh_error} @peptable;
+
+        my $thresh_score = $min_score;
+
+        SCORE:
+        while ($thresh_score <= $max_score) {
+            
+            my @filt_by_both = grep {$_->ion_score >= $thresh_score} @filt_by_err;
+
+            my $result = $fix_fdr ? calculate_FDR_fixed( @filt_by_both )
+                                  : calculate_FDR(       @filt_by_both );
+            my $fdr = $result->{FDR};
+            last SCORE if ($fdr < 0);
+            my $fwd = $result->{fwd_count};
+            if ($fdr <= $target_FDR) {
+
+                if ( ! defined $best_result
+                  || $fwd > $best_result->{fwd_count}
+                  || ($fwd == $best_result->{fwd_count}
+                      && $fdr < $best_result->{FDR}) ) {
+
+                    $result->{score} = $thresh_score;
+                    $result->{error} = $thresh_error;
+                    $best_result = $result;
+                }
+                last SCORE;
+
+            }
+            $thresh_score += $score_step;
+
+        } 
+        $thresh_error -= $step_ppm;
+
+    } 
+
+    die "Unable to achieve target FDR for noncharge search"
+        if (! defined $best_result);
+
+    return ($best_result);
+}
+
+
+##############################################################################
+# populates %annots with IDs and annotations
+sub read_db {
+    
+    my ($fn_fasta) = @_;
+    open my $fh_fasta, '<', $fn_fasta;
+    my %annots;
+    while (my $line = <$fh_fasta>) {
+        chomp $line;
+        if ($line =~ /^>(\S+?)\s+(.+)/) { # split header on first whitespace
+            $annots{$1} = $2;
+        }
+    }
+    close $fh_fasta;
+    return %annots;
+}
+
+
+__END__
+
+=head1 NAME
+
+fdr - filter pepXML file by controlling for FDR
+
+=head1 VERSION
+
+This documentation refers to fdr version 5.02a
+
+=head1 USAGE
+
+fdr --input F<input.pep.xml> --db F<seqs.fasta> [--option value]
+
+=head1 REQUIRED ARGUMENTS
+
+=over 4
+
+=item B<--input> F<filename>
+
+Path to input pepXML file
+
+=item B<--db> F<filename>
+
+Path to fasta-formatted database used in search
+
+=back
+
+=head1 OPTIONAL ARGUMENTS
+
+=over 4
+
+=item B<--peptide_table> F<filename>
+
+Filename where tab-delimited peptide table will be printed, formatted as in
+previous versions of the program
+
+=item B<--cutoff_table> F<filename>
+
+Filename where short summary of calculated cutoffs will be printed, formatted
+as in previous versions of the program
+
+=item B<--filtered> F<filename>
+
+Filename where non-charge-separated filtered pepXML file will be written
+
+=item B<--filt_by_charge F<filename>
+
+Filename where charge-separated filtered pepXML file will be written
+
+=item B<--for_census F<filename>
+
+Filename where reformatted file will be written which is suitable for CENSUS
+input. This will be based on charge-separated cutoffs if written or else
+non-charge-separated cutoffs.
+
+=item B<--mods> F<filename>
+
+Path to file containing modification masses for Census
+
+=item B<--search_engine> <mascot|sequest|omssa>
+
+Program used in spectral search (default: mascot)
+
+=item B<--15N>
+
+Assume 15N masses. If not given, assumes 14N masses
+
+=item B<--target_fdr> <float>
+
+Target false discovery rate (default: 0.01)
+
+=item B<--max_err> <float>
+
+Maximum PPM mass error to test during FDR determination (default: 30)
+
+=item B<--min_score> <float>
+
+Minimum threshold score to test during FDR determination (default: 10)
+
+=item B<--max_score> <float>
+
+Maximum threshold score to test during FDR determination (default: 100)
+
+=item B<--min_z> <int>
+
+Minimum charge state to test during FDR determination - peptides with lower
+charge state are discarded during filtering-by-charge (default: 2)
+
+=item B<--max_z> <int>
+
+Maximum charge state to test during FDR determination - peptides with higher
+charge state are grouped with max_z peptides during filtering-by-charge (default: 5)
+
+=item B<--decoy_tag> <string>
+
+Tag appended to protein database IDs to indicate decoy sequences (default: REV)
+
+=item B<--score_step> <float>
+
+Step used to increment threshold scores during FDR determination (default: 1.0)
+
+=item B<--err_step> <float>
+
+Step used to increment mass error during FDR determination (ppm) (default: 0.5)
+
+=item B<--fix_fdr>
+
+Use fixed routine for calculating FDR (slightly different than Madhu's
+routine, which may have had a bug)
+
+=item B<--use_all>
+
+Use all peptides during FDR calculation rather than collapsing to unique
+peptide/mass IDs (which is the default behavior)
+
+=item B<--fix_paths>
+
+In file metadata, trim file paths to basename only (for CENSUS input)
+
+=item B<--emulate>
+
+For backward compatibility and testing. Attempts to produce identical behavior
+and output of previous versions of script (including bugs/quirks)
+
+=item B<--verbose>
+
+Print various status messages during processing
+
+=item B<--help>
+
+Print this informational message
+
+=back
+
+=head1 DESCRIPTION
+
+fdr calculates charge-separated and non-separated false discovery rates
+based on MS/MS search results in pepXML format. It optimizes threshold
+score cutoff and mass error tolerance for a target FDR and filters the
+pepXML file based on the calculated criteria. It can also format the output
+for downstream analysis using CENSUS.
+
+The code has been significantly refactored since Madhu's last version. In
+addition to optimizations and tweaks to the algorithms, files are now printed
+out upon request using filenames provided. This increases flexibility -
+however, the '--emulate' option can be used to emulate the old behavior
+(hard-coded file names, a few quirks, etc). This should produce identical
+output to what the old versions would have produced.
+
+=head1 DIAGNOSTICS
+
+=head1 DEPENDENCIES
+
+XML::Twig
+
+Config::Tiny
+
+IPC::System::Simple (for system autodie)
+
+=head1 BUGS AND CAVEATS
+
+max_z was not honored in the old version (cutoff was hard-coded at 3). This
+has been fixed, although the old behavior is used with '--emulate';
+
+Actual FDR calculation appears to be flawed (requires discussion). A 'fixed'
+calculation can be used with '--fix_fdr'.
+
+=head1 AUTHORS
+
+Original script by Madhu Sudan Hari. Modified and re-factored by Jeremy Volkening
+
+=head1 LICENSE AND COPYRIGHT
+
+Copyright 2014 Sussman Laboratory, University of Wisconsin-Madison
+
+This program is free software: you can redistribute it and/or modify
+it under the terms of the GNU General Public License as published by
+the Free Software Foundation, either version 3 of the License, or
+(at your option) any later version.
+
+This program is distributed in the hope that it will be useful,
+but WITHOUT ANY WARRANTY; without even the implied warranty of
+MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+GNU General Public License for more details.
+
+You should have received a copy of the GNU General Public License
+along with this program.  If not, see <http://www.gnu.org/licenses/>.

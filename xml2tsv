@@ -1,0 +1,44 @@
+#!/usr/bin/perl
+
+eval 'exec /usr/bin/perl  -S $0 ${1+"$@"}'
+    if 0; # not running under some shell
+
+use strict;
+use warnings;
+use MS::Parser::PepXML;
+
+my $p = MS::Parser::PepXML->new($ARGV[0]);
+
+print "idx\tscan_idx\tret_time\tmass\tcharge\tpeptide\tprotein_id\n";
+
+RUN:
+while (my $run = $p->next_run) {
+    QUERY:
+    while (my $q = $run->next_query) {
+        my $ret = $q->{retention_time_sec};
+        my $mass = $q->{precursor_neutral_mass};
+        my $charge = $q->{assumed_charge};
+        my $idx = $q->{index};
+        my $start = $q->{start_scan};
+        my $name = $q->{spectrum};
+        die "scan mismatch" if ($start != $q->{end_scan});
+
+        my @res = @{ $q->{results} };
+        die "bad result count" if (@res != 1);
+        my $r = $res[0];
+
+        my @hits = @{ $r->{hits} };
+        die "bad hit count" if (@hits != 1);
+        my $h = $hits[0];
+        my $peptide = $h->{peptide};
+        my $protein = $h->{protein};
+        if ($protein =~ /REV\|$/) {
+            warn "SKIPPED REVERSE $protein\n";
+            next QUERY;
+        }
+        print "$idx\t$name\t$ret\t$mass\t$charge\t$peptide\t$protein\n";
+    }
+}
+
+    
+

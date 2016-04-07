@@ -1,0 +1,567 @@
+#!/usr/bin/perl 
+
+use strict;
+use warnings;
+use Data::Dumper;
+use MS::Parser::MzML;
+use MS::Parser::PepXML;
+use MS::CV qw/:constants/;
+use MS::Mass qw/elem_mass/;
+use Getopt::Long;
+use List::MoreUtils qw/uniq first_index/;
+use List::Util qw/min max sum first/;
+use Math::Matrix;
+use threads;
+use threads::shared;
+use Thread::Queue;
+use Thread::Semaphore;
+
+use constant PROTON => elem_mass('H');
+
+our $VERSION = 0.009;
+
+my $fn_tags;
+my $correct_coelute = 0;
+my $max_coelute     = 1;
+my $reporter_tol    = 20;
+my $pre_tol         = 10;
+my $pre_shift       = 0;
+my $fuzzy_edges     = 0;
+my $scale_by_inj    = 0;
+my $print_obs       = 0;
+my $recal_reporters = 0;
+my $sd_tol          = 3;
+my $min_int         = 0;
+my $threads         = 1;
+my $decoy_tag       = 'REV_';
+my $fn_impurities;
+my $fn_map;
+my $zero_floor;
+my $filter_unlabeled;
+my $digits;
+
+my @orig_argv = @ARGV;
+
+GetOptions(
+    'tags=s'          => \$fn_tags,
+    'correct_coelute' => \$correct_coelute,
+    'max_coelute=f'   => \$max_coelute,
+    'reporter_tol=f'  => \$reporter_tol,
+    'pre_tol=f'       => \$pre_tol,
+    'pre_shift=f'     => \$pre_shift,
+    'fuzzy_edges'     => \$fuzzy_edges,
+    'scale_by_inj'    => \$scale_by_inj,
+    'output_obs'      => \$print_obs,
+    'sd_tol=f'        => \$sd_tol,
+    'recal_reporters' => \$recal_reporters,
+    'impurities=s'    => \$fn_impurities,
+    'min_intensity=f' => \$min_int,
+    'threads=i'       => \$threads,
+    'map=s'           => \$fn_map,
+    'decoy_tag=s'     => \$decoy_tag,
+    'zero_floor'      => \$zero_floor,
+    'filter_unlabeled' => \$filter_unlabeled,
+    'digits=i'        => \$digits,
+) or die "Error parsing options\n";
+
+die "Tag configuration file required" if (! defined $fn_tags);
+
+# read in tag masses
+my @reporters;
+open my $tags, '<', $fn_tags or die "Error opening tags file: $!\n";
+while (my $line = <$tags>) {
+    chomp $line;
+    my @vals = split "\t", $line;
+    die "Invalid tag file\n" if (scalar(@vals) != 2);
+    die "Invalid tag file\n" if ($vals[1] !~ /^[\d\.]+$/);
+    push @reporters, [@vals];
+}
+close $tags;
+
+my $REP_LOWER = min( map {$_->[1]} @reporters) - 1;
+my $REP_UPPER = max( map {$_->[1]} @reporters) + 1;
+
+for (@reporters) {
+    push @{ $_ },
+        $_->[1] - $reporter_tol/1000000*$_->[1],
+        $_->[1] + $reporter_tol/1000000*$_->[1];
+}
+#@reporters are now each [name, mass, lower_mass, upper_mass]
+
+my $pepxml = $ARGV[-1];
+
+warn "Windows for first scan:\n";
+for (@reporters) {
+    warn "$_->[0]\t$_->[2]\t$_->[3]\n";
+}
+
+# import isotope impurity matrix, if provided
+my $impurities;
+if (defined $fn_impurities) {
+    open my $in, '<', $fn_impurities;
+    my $h = <$in>;
+    my @m;
+    while (my $line = <$in>) {
+        chomp $line;
+        my @parts = split "\t", $line;
+        shift @parts;
+        push @m, [@parts];
+    }
+    $impurities = Math::Matrix->new( @m )->transpose;
+}
+
+# track reporter mass error for summary purposes
+my %obs_mz  = map {$_->[0] => []} @reporters;
+my %obs_int = map {$_->[0] => []} @reporters;
+my $obs_mz  = shared_clone(\%obs_mz);
+my $obs_int = shared_clone(\%obs_int);
+
+my @channel_sums :shared = map {0} (0..$#reporters);
+
+my @spectra :shared = ();
+
+my $hit_queue = Thread::Queue->new();
+my @workers;
+for (1..$threads) {
+    push @workers, threads->create(\&process_psm);
+}
+
+my %name_map = map {$_ => $_} map {$_->[0]} @reporters;
+my @output_order = (0..$#reporters);
+if (defined $fn_map) {
+    %name_map = ();
+    @output_order = ();
+    open my $in, '<', $fn_map;
+    while (my $line = <$in>) {
+        chomp $line;
+        my ($id,$sample,$temp) = split "\t", $line;
+        push @output_order, (first_index {$_ eq $id} map {$_->[0]} @reporters);
+        $name_map{$id} = "${sample}_$temp";
+    }
+}
+warn "order: @output_order\n";
+
+load_queue( MS::Parser::PepXML->new($pepxml) );
+
+# wait for all threads to finish
+for (@workers) {
+    $_->join();
+}
+
+# correct channel sums for impurities
+if (defined $impurities) {
+    my $uncorrected = Math::Matrix->new([@channel_sums]);
+    my $a = $impurities->concat( $uncorrected->transpose );
+    @channel_sums = @{ $a->solve()->transpose->[0] };
+}
+
+if ($print_obs) {
+    for (keys %{$obs_mz}) {
+        my @observed_mz  = @{ $obs_mz->{$_}  };
+        my @observed_int = @{ $obs_int->{$_} };
+        my $m = median(@observed_mz);
+        for (0..$#observed_mz) {
+            my $mz  = $observed_mz[$_];
+            my $int = $observed_int[$_];
+            my $diff = $mz - $m;
+            print "$mz\t$diff\t$int\n";
+        }
+    }
+    exit;
+}
+
+if ($recal_reporters) {
+    warn "----------------------\n";
+    warn "recalibrated channels:\n";
+    for my $i (0..$#reporters) {
+        my $name = $reporters[$i]->[0];
+        my @observed = @{ $obs_mz->{$name} };
+        my $med = median(@observed);
+        $reporters[$i]->[1] = $med;
+    }
+    for my $i (0..$#reporters) {
+        my $lower = $reporters[$i]->[1]*(1-$reporter_tol*1.5/1000000);
+        my $upper = $reporters[$i]->[1]*(1+$reporter_tol*1.5/1000000);
+        
+        if ($i > 0) {
+            my $mid = ($reporters[$i-1]->[1] + $reporters[$i]->[1])/2;
+            $lower = $mid if ($lower < $mid);
+        }
+        if ($i < $#reporters) {
+            my $mid = ($reporters[$i]->[1] + $reporters[$i+1]->[1])/2;
+            $upper = $mid if ($upper > $mid);
+        }
+
+        $reporters[$i]->[2] = $lower;
+        $reporters[$i]->[3] = $upper;
+        warn join("\t",@{$reporters[$i]}), "\n";
+    }
+    warn "----------------------\n";
+}
+
+my $total_int = sum @channel_sums;
+my @scale_factors = map {$_/$total_int} @channel_sums;
+
+print "## Produced by tmt_quant v$VERSION\n";
+print "## Command-line arguments: @orig_argv\n";
+print "## Final reporter windows:\n";
+for my $i (0..$#reporters) {
+    print "##   ", join("\t",@{$reporters[$i]}[0,2,3]), "\n";
+}
+
+my $c = scalar(@spectra);
+warn "counted $c spectra\n";
+
+print "id\tprobability\tpeptide\tprotein\tcoelute_inf\tis_ntagged\ttagged_Lys\t";
+print join("\t", map {$name_map{$_->[0]}} @reporters[@output_order]), "\n";
+
+SPECTRUM:
+for my $spectrum (@spectra) {
+
+    my @parts = @{$spectrum};
+    my ($name,$prob,$peptide,$protein,$inf,$baseline,$is_ntagged,$tagged_lys)
+        = splice @parts, 0, 8;
+    if (! scalar(@parts)) {
+        warn "empty reporter window\n";
+        next SPECTRUM;
+    }
+    die "reporter values not multiple of 2!\n" if (scalar(@parts) % 2);
+    my $mid = scalar(@parts)/2;
+    my @mz_reporter_win  = @parts[0..$mid-1];
+    my @int_reporter_win = @parts[$mid..$#parts];
+    my ($rep_mz,$rep_int) = extract_channels(\@mz_reporter_win, \@int_reporter_win);
+    my @values = map {defined $rep_int->{$_->[0]} ? $rep_int->{$_->[0]} : $baseline} @reporters;
+    
+    if (max(@values) < $min_int) {
+        warn "below min int\n";
+        next SPECTRUM;
+    }
+
+    next SPECTRUM if ($max_coelute && $inf > $max_coelute);
+
+    # correct channel sums for impurities
+    if (defined $impurities) {
+        my $uncorrected = Math::Matrix->new([@values]);
+        my $a = $impurities->concat( $uncorrected->transpose );
+        @values = @{ $a->solve()->transpose->[0] };
+    }
+
+    # correct for coeluting precursors
+    my @interferences = map {0} @scale_factors;
+    if ($correct_coelute) {
+        my $sum_interference = sum(@values) * $inf;
+        @interferences = map {$_ * $sum_interference} @scale_factors;
+    }
+
+    my $print_string = "$name\t$prob\t$peptide\t$protein\t$inf\t$is_ntagged\t$tagged_lys";
+    for (@output_order) {
+        my $int  = $values[$_] - $interferences[$_];
+        $int = 0 if ($int < 0 && $zero_floor);
+        if (defined $digits) {
+            $int = sprintf "%.${digits}f", $int;
+        }
+        $print_string .= "\t$int";
+    }
+    $print_string .= "\n";
+    print $print_string;
+
+}
+
+exit;
+
+sub round {
+
+    my ($val,$places) = @_;
+    if ($val > 0) {
+        return int($val*10**$places+0.5)/10**$places;
+    }
+    else {
+        return -int(-$val*10**$places+0.5)/10**$places;
+    }
+
+}
+
+sub process_psm {
+
+    my $px_parser = MS::Parser::PepXML->new($pepxml);
+    my %mzml;
+    while (my $run = $px_parser->next_run) {
+        my $mzml_fn = $run->{raw_file};
+        if (! defined $mzml{$mzml_fn}) {
+            my $mx_parser = MS::Parser::MzML->new($mzml_fn);
+            $mzml{$mzml_fn} = $mx_parser;
+        }
+    }
+
+    SPECTRUM:
+    while (my $hit = $hit_queue->dequeue()) {
+        my ($run_idx, $query_idx) = @{ $hit };
+
+        my $run = $px_parser->fetch_run($run_idx);
+        my $query = $run->fetch_query($query_idx);
+        my $mzml_fn = $run->{raw_file};
+        my $mx_parser = $mzml{$mzml_fn};
+        my $scan_num = $query->{start_scan};
+        my $ms2 = $mx_parser->fetch_spectrum($scan_num);
+
+        my $inf = 'NA';
+
+        #extract peptide and protein group string
+        my $name = $query->{spectrum};
+        my $peptide;
+        my @proteins;
+        my $top = $query->top_hit();
+
+        $peptide = $top->{peptide};
+
+        my $nterm_mod = $top->{modification_info}->{mod_nterm_mass};
+        my $is_ntagged = 0;
+        $is_ntagged = 1 if (defined $nterm_mod
+            && $nterm_mod > 230.169 && $nterm_mod < 230.172);
+
+        my $tagged_lys = 0;
+        if (defined $top->{modification_info}->{mod_aminoacid_mass}) {
+            for ( @{ $top->{modification_info}->{mod_aminoacid_mass} } ) {
+                ++$tagged_lys if ($_->{mass} > 357.254 && $_->{mass} < 357.260);
+            }
+        }
+
+        #skip peptides with no N-term labeled and no labeled lysines
+        next PEPTIDE if ($filter_unlabeled && ($is_ntagged + $tagged_lys == 0));
+
+        my $protein = $top->{protein};
+        $protein =~ s/\|.*$//;
+        $protein =~ s/\.\d+$//;
+        push @proteins, $protein;
+
+        if (defined $top->{alternative_protein}) {
+            for (@{ $top->{alternative_protein} }) {
+                my $p = $_->{protein};
+                $p =~ s/\|.*$//;
+                $p =~ s/\.\d+$//;
+                next if ($p =~ /^$decoy_tag/);
+                push @proteins, $p;
+            }
+        }
+
+        $protein = join('|', sort {$a cmp $b} uniq @proteins);
+
+        my %scores;
+        for (@{ $top->{analysis_result} }) {
+            my $name = $_->{analysis};
+            $scores{$name} = $_->{"${name}_result"}->{probability};
+        }
+        my $prob = first {defined $_} ($scores{interprophet},
+            $scores{peptideprophet}, '');
+            
+        my $inj_time = $scale_by_inj
+            ? $ms2->{scanList}->{scan}->[0]->{cvParam}->{&ION_INJECTION_TIME}->[0]->{value}
+            : 1;
+        my @mz  = $ms2->mz();
+        my @int = map {$_ * $inj_time} $ms2->int();
+        my $baseline = min @int;
+
+        my @mz_reporter_win;
+        my @int_reporter_win;
+        MZ:
+        for my $i (0..$#mz) {
+            my $mass = $mz[$i];
+            next MZ if ($mass < $REP_LOWER);
+            last MZ if ($mass > $REP_UPPER);
+            push @mz_reporter_win,  $mz[$i];
+            push @int_reporter_win, $int[$i];
+        }
+        my ($rep_mz,$rep_int) = extract_channels(\@mz_reporter_win, \@int_reporter_win);
+
+        my @values = map {defined $rep_int->{$_->[0]} ? $rep_int->{$_->[0]} : $baseline} @reporters;
+
+        if ($correct_coelute || $max_coelute) {
+
+            # calculate S2I
+
+            my $rt_m      = $ms2->rt();
+            my $precursor = $ms2->precursor();
+
+            my $iso_mz = $precursor->{iso_mz};
+            my $lower  = $precursor->{iso_lower};
+            my $upper  = $precursor->{iso_upper};
+            my $p_mz   = $precursor->{mono_mz};
+            my $charge = $precursor->{charge};
+
+            # get survey scan
+            $mx_parser->goto_spectrum( $precursor->{scan_id} );
+            my $ms1_e = $mx_parser->next_spectrum();
+            die "failed to fetch MS1" if (! defined $ms1_e);
+
+            my $rt_e = $ms1_e->rt();
+
+            # calculate initial S2I
+            my @mz  = $ms1_e->mz();
+            my @int = $ms1_e->int();
+
+            my $pre_sum = 0;
+            my $all_sum = 0;
+            MZ:
+            for my $i (0..$#mz) {
+                my $mass = $mz[$i];
+                my $tol = $mass * $pre_tol / 1000000;
+                my $shift = $mass * $pre_shift / 1000000;
+                next MZ if ($mass < $lower - ($tol - $shift)*$fuzzy_edges);
+                last MZ if ($mass > $upper + ($tol + $shift)*$fuzzy_edges);
+                my $abund = $int[$i];
+                my $tag = "$mass\t$abund\t$tol";
+                $all_sum += $abund;
+
+                my $proposed_H = round(($mass - $p_mz) * $charge, 0);
+                my $err = $mass - ($p_mz + $proposed_H * PROTON / $charge);
+                if (abs($err) <= $tol) {
+                    $pre_sum += $abund;
+                    $tag .= '*';
+                }
+
+            }
+            my $s2i_e = ($all_sum > 0) ? $pre_sum/$all_sum : 0;
+            my $s2i = $s2i_e;
+
+            # also do following MS1 if present
+            my $ms1_l;
+            while ( my $scan = $mx_parser->next_spectrum() ) {
+                if ($scan->ms_level() == 1) {
+                    $ms1_l = $scan;
+                    last;
+                }
+            }
+
+            # also do following MS1 if present
+            if (defined $ms1_l) {
+
+                my $rt_l = $ms1_l->rt();
+
+                # calculate next S2I
+                my @mz  = $ms1_l->mz();
+                my @int = $ms1_l->int();
+
+                my $pre_sum = 0;
+                my $all_sum = 0;
+                MZ:
+                for my $i (0..$#mz) {
+                    my $mass = $mz[$i];
+                    my $tol = $mass * $pre_tol / 1000000;
+                    my $shift = $mass * $pre_shift / 1000000;
+                    next MZ if ($mass < $lower - ($tol - $shift)*$fuzzy_edges);
+                    last MZ if ($mass > $upper + ($tol + $shift)*$fuzzy_edges);
+                    my $abund = $int[$i];
+                    $all_sum += $abund;
+                    my $tag = "$mass\t$abund\t$tol";
+
+                    my $proposed_H = round(($mass - $p_mz) * $charge, 0);
+                    my $err = $mass - ($p_mz + $proposed_H * PROTON / $charge);
+                    if (abs($err) <= $tol) {
+                        $pre_sum += $abund;
+                        $tag .= '*';
+                    }
+
+                }
+                my $s2i_l = ($all_sum > 0) ? $pre_sum/$all_sum : 0;
+                $s2i = ($rt_m - $rt_e)*($s2i_l - $s2i_e)/($rt_l - $rt_e) + $s2i_e;
+
+            }
+            else {
+                warn "failed to find following MS1\n";
+            }
+
+            #decontaminate
+            
+            $inf = 1 - $s2i;
+        }
+
+        if ($zero_floor) {
+            @values = map {$_ > 0 ? $_ : 0} @values;
+        }
+
+
+        {
+            lock $obs_mz;
+            for (keys %{ $rep_mz }) {
+                push @{ $obs_mz->{ $_ } },  $rep_mz->{$_};
+            }
+        }
+        {
+            lock $obs_int;
+            for (keys %{ $rep_int }) {
+                push @{ $obs_int->{ $_ } },  $rep_int->{$_};
+            }
+        }
+        {
+            lock @channel_sums;
+            for (0..$#values) {
+                    $channel_sums[$_] += $values[$_];
+            }
+        }
+        {
+            lock @spectra;
+            my @sp = ($name, $prob, $peptide, $protein, $inf, $baseline, $is_ntagged,
+                $tagged_lys, @mz_reporter_win, @int_reporter_win);
+            push @spectra, shared_clone([@sp]);
+        }
+
+    }
+}
+
+sub load_queue  {
+
+    my ($px_parser) = @_;
+
+    RUN:
+    while (defined(my $run_idx = $px_parser->next_run_index )) {
+        my $run = $px_parser->fetch_run( $run_idx );
+        SPECTRUM:
+        while (my $idx = $run->next_index) {
+            $hit_queue->enqueue( [$run_idx, $idx] );
+        }
+    }
+    warn "done loading\n";
+    $hit_queue->enqueue(undef) for (1..$threads);
+
+}
+
+
+sub extract_channels {
+
+    my %rep_mz;
+    my %rep_int;
+
+    my ($mz_ref, $int_ref) = @_;
+    for my $i (0..$#{$mz_ref}) {
+        my $mass = $mz_ref->[$i];
+        for (@reporters) {
+            if ($mass > $_->[2] && $mass <= $_->[3]) {
+                my $int = $int_ref->[$i];
+                if (defined $rep_int{$_->[0]}) {
+                    #warn "channel already defined for scan $scan_num channel $_->[0]\n";
+                    if ($int > $rep_int{$_->[0]}) {
+                        $rep_int{$_->[0]} = $int;
+                        $rep_mz{$_->[0]}  = $mass;
+                    }
+                }
+                else {
+                    $rep_int{$_->[0]} = $int;
+                    $rep_mz{$_->[0]}  = $mass;
+                }
+            }
+        }
+    }
+    return {%rep_mz}, {%rep_int};
+}
+
+sub median {
+
+    my (@vals) = @_;
+    return if (scalar(@vals) < 1);
+    my $mid_idx = int(scalar(@vals)/2);
+    return scalar(@vals) % 2
+        ?  $vals[$mid_idx]
+        : ($vals[$mid_idx] + $vals[$mid_idx-1])/2;
+
+}
+    
