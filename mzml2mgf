@@ -101,7 +101,6 @@ sub process_spectrum {
         $qo->enqueue( [$idx, $chunk] );
 
     }
-    warn "Bye\n";
 
 }
 
