@@ -4,7 +4,7 @@ use v5.10.1;
 use strict;
 use warnings;
 
-use MS::Parser::MzML;
+use MS::Reader::MzML;
 use Data::Dumper;
 use Getopt::Long;
 use POSIX qw/floor/;
@@ -33,8 +33,8 @@ GetOptions(
 
 die "Input not found\n" if (! -e $fn_in);
 
-my $parser = MS::Parser::MzML->new($fn_in);
-my $run_id = $parser->{mzML}->{run}->{id};
+my $parser = MS::Reader::MzML->new($fn_in);
+my $run_id = $parser->id;
 
 my $qi = Thread::Queue->new();
 my $qo = Thread::Queue->new();
@@ -45,12 +45,9 @@ for (1..$threads) {
 }
 
 # load queue
-my @idx_list; #track spectrum order
-my $idx = $parser->first_spectrum_index;
-while (defined $idx) {
-    $qi->enqueue($idx);
-    push @idx_list, $idx;
-    $idx = $parser->next_spectrum_index($idx);
+my $c = $parser->record_count('spectrum');
+for (0..$c-1) {
+    $qi->enqueue($_);
 }
 $qi->enqueue(undef) for (1..$threads);
 my $printer = threads->create(\&handle_output);
@@ -66,9 +63,9 @@ exit;
 
 sub process_spectrum {
 
-    my $p = MS::Parser::MzML->new($fn_in);
+    my $p = MS::Reader::MzML->new($fn_in);
 
-    while (my $idx = $qi->dequeue()) {
+    while (defined (my $idx = $qi->dequeue())) {
         my $spectrum = $p->fetch_spectrum($idx);
 
         if ($spectrum->ms_level != $ms_level) {
@@ -82,8 +79,8 @@ sub process_spectrum {
         my $pre_mass = $pre->{mono_mz};
         my $pre_int  = defined $pre->{intensity} ? $pre->{intensity} + 0 : undef;
         $pre_mass .= " $pre_int" if (defined $pre_int);
-        my @int = $spectrum->int();
-        my @mz   = $spectrum->mz();
+        my $int = $spectrum->int;
+        my $mz   = $spectrum->mz;
         if ($id =~ /scan=(\d+)$/) {
             $id = $1;
         }
@@ -95,9 +92,9 @@ sub process_spectrum {
         $chunk .= "RTINSECONDS=$rt\n";
         $chunk .= "PEPMASS=$pre_mass\n";
         $chunk .= "CHARGE=$charge+\n";
-        for (0..$#mz) {
-            my $mass = round( $mz[$_], $mz_places );
-            my $intensity = round( $int[$_], $int_places );
+        for (0..$#{$mz}) {
+            my $mass = round( $mz->[$_], $mz_places );
+            my $intensity = round( $int->[$_], $int_places );
             $chunk .= "$mass $intensity\n";
         }
         $chunk .= "END IONS\n";
@@ -116,12 +113,13 @@ sub handle_output {
         open $fh_out, '>', $fn_out;
     }
 
+    my $curr_idx = 0;
     my @waiting;
     while (my $ref = $qo->dequeue()) {
         my ($idx, $chunk) = @{$ref};
-        if ($idx eq $idx_list[0]) {
+        if ($idx eq $curr_idx) {
             print {$fh_out} $chunk if (defined $chunk);
-            shift @idx_list;
+            ++$curr_idx;
         }
         else {
             push @waiting, $ref;
@@ -131,9 +129,9 @@ sub handle_output {
             $loop = 0;
             my @tmp;
             while (my $item = pop @waiting) {
-                if ($item->[0] eq $idx_list[0]) {
+                if ($item->[0] eq $curr_idx) {
                     print {$fh_out} $item->[1] if (defined $item->[1]);
-                    shift @idx_list;
+                    ++$curr_idx;
                     ++$loop;
                 }
                 else {
