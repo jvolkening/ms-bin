@@ -45,7 +45,7 @@ for (1..$threads) {
 }
 
 # load queue
-my $c = $parser->record_count('spectrum');
+my $c = $parser->n_spectra;
 for (0..$c-1) {
     $qi->enqueue($_);
 }
