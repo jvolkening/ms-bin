@@ -1,0 +1,139 @@
+#!/usr/bin/env perl
+
+# re-calculates index offsets and SHA1 sum for indexed mzML file that has been
+# modified for some reason
+
+use strict;
+use warnings;
+
+use XML::Parser;
+use Digest::SHA;
+
+my $parser = new XML::Parser(
+    Handlers => {
+        Start   => \&_handle_start,
+        End     => \&_handle_end,
+        Char    => \&_handle_char,
+        Default => \&_handle_default,
+    }
+);
+
+# tracking variables
+my %new_offsets;
+my $curr_string = '';
+my $curr_index;
+my $curr_id;
+my $print_content = 1;
+my $checksum;
+
+my $digest = Digest::SHA->new('SHA1');
+
+$parser->parse(\*STDIN);
+
+exit;
+
+
+
+sub print_sha {
+
+    # add data to SHA1 calculation before printing
+
+    my ($data) = @_;
+    $digest->add($data);
+    print $data;
+
+}
+
+sub parent {
+
+    my ($expat, $expect) = @_;
+    return '/' . join "/", $expat->context;
+
+}
+
+sub _handle_start {
+
+    my ($p, $el, %attrs) = @_;
+
+    if ( ($el eq 'spectrum' || $el eq 'chromatogram')
+            && parent($p) eq "/indexedmzML/mzML/run/${el}List") {
+
+        my $id = $attrs{id};
+        $new_offsets{ $el }->{ $id } = $p->current_byte;
+
+    }
+
+    elsif ($el eq 'index' && parent($p) eq '/indexedmzML/indexList') {
+
+        $curr_index = $attrs{name};
+
+    }
+
+    elsif ($el eq 'offset' && parent($p) eq '/indexedmzML/indexList/index') {
+
+        $curr_id = $attrs{idRef};
+        $print_content = 0;
+
+    }
+
+    print_sha $p->original_string; 
+
+    if ($el eq 'fileChecksum' && parent($p) eq '/indexedmzML') {
+
+        $checksum = $digest->hexdigest;
+        $print_content = 0;
+
+    }
+
+}
+
+sub _handle_end {
+
+    my ($p, $el, %attrs) = @_;
+
+    if ($el eq 'offset' && parent($p) eq '/indexedmzML/indexList/index') {
+
+        # replace offset value
+
+        die "Missing index offset for $curr_index : $curr_id"
+            if (! defined $new_offsets{ $curr_index }->{ $curr_id });
+        print_sha $new_offsets{ $curr_index }->{ $curr_id };
+        $print_content = 1;
+
+    }
+
+    elsif ($el eq 'fileChecksum' && parent($p) eq '/indexedmzML') {
+
+        # replace checksum value
+
+        print_sha $checksum;
+        $print_content = 1;
+
+    }
+
+    # always reset content string on tag close
+    $curr_string = '';
+
+    print_sha $p->original_string; 
+
+}
+
+sub _handle_char {
+
+    my ($p, $str) = @_;
+
+    $curr_string .= $str;
+
+    print_sha $p->original_string
+        if ($print_content);
+
+}
+
+sub _handle_default {
+
+    my ($p, $str) = @_;
+
+    print_sha $p->original_string
+        if ($print_content);
+
+}
