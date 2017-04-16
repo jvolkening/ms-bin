@@ -338,14 +338,14 @@ sub process_psm {
         next PEPTIDE if ($filter_unlabeled && ($is_ntagged + $tagged_lys == 0));
 
         my $protein = $top->{protein};
-        $protein =~ s/\|.*$//;
+        $protein =~ s/\|/_/g;
         $protein =~ s/\.\d+$//;
         push @proteins, $protein;
 
         if (defined $top->{alternative_protein}) {
             for (@{ $top->{alternative_protein} }) {
                 my $p = $_->{protein};
-                $p =~ s/\|.*$//;
+                $p =~ s/\|/_/;
                 $p =~ s/\.\d+$//;
                 next if ($p =~ /^$decoy_tag/);
                 push @proteins, $p;
