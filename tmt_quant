@@ -3,9 +3,9 @@
 use strict;
 use warnings;
 use Data::Dumper;
-use MS::Parser::MzML;
-use MS::Parser::PepXML;
-use MS::CV qw/:constants/;
+use MS::Reader::MzML;
+use MS::Reader::PepXML;
+use MS::CV qw/:MS/;
 use MS::Mass qw/elem_mass/;
 use Getopt::Long;
 use List::MoreUtils qw/uniq first_index/;
@@ -88,7 +88,7 @@ for (@reporters) {
 }
 #@reporters are now each [name, mass, lower_mass, upper_mass]
 
-my $pepxml = $ARGV[-1];
+my $pepxml :shared = $ARGV[-1];
 
 warn "Windows for first scan:\n";
 for (@reporters) {
@@ -141,7 +141,7 @@ if (defined $fn_map) {
 }
 warn "order: @output_order\n";
 
-load_queue( MS::Parser::PepXML->new($pepxml) );
+load_queue();
 
 # wait for all threads to finish
 for (@workers) {
@@ -219,6 +219,7 @@ SPECTRUM:
 for my $spectrum (@spectra) {
 
     my @parts = @{$spectrum};
+
     my ($name,$prob,$peptide,$protein,$inf,$baseline,$is_ntagged,$tagged_lys)
         = splice @parts, 0, 8;
     if (! scalar(@parts)) {
@@ -283,12 +284,18 @@ sub round {
 
 sub process_psm {
 
-    my $px_parser = MS::Parser::PepXML->new($pepxml);
+    my $px_parser;
+    {
+        lock $pepxml;
+        $px_parser = MS::Reader::PepXML->new($pepxml);
+    }
+
     my %mzml;
-    while (my $run = $px_parser->next_run) {
-        my $mzml_fn = $run->{raw_file};
+    for my $run (0..$px_parser->n_lists()-1) {
+        $px_parser->goto_list($run);
+        my $mzml_fn = $px_parser->raw_file($run);
         if (! defined $mzml{$mzml_fn}) {
-            my $mx_parser = MS::Parser::MzML->new($mzml_fn);
+            my $mx_parser = MS::Reader::MzML->new($mzml_fn);
             $mzml{$mzml_fn} = $mx_parser;
         }
     }
@@ -297,12 +304,13 @@ sub process_psm {
     while (my $hit = $hit_queue->dequeue()) {
         my ($run_idx, $query_idx) = @{ $hit };
 
-        my $run = $px_parser->fetch_run($run_idx);
-        my $query = $run->fetch_query($query_idx);
-        my $mzml_fn = $run->{raw_file};
+        $px_parser->goto_list($run_idx);
+        my $query = $px_parser->fetch_result($query_idx);
+        my $mzml_fn = $px_parser->raw_file($run_idx);
         my $mx_parser = $mzml{$mzml_fn};
-        my $scan_num = $query->{start_scan};
-        my $ms2 = $mx_parser->fetch_spectrum($scan_num);
+        my $scan_id = $query->{spectrumNativeID};
+        my $scan_idx = $mx_parser->spectrum_index_by_id($scan_id);
+        my $ms2 = $mx_parser->fetch_spectrum($scan_idx);
 
         my $inf = 'NA';
 
@@ -310,7 +318,7 @@ sub process_psm {
         my $name = $query->{spectrum};
         my $peptide;
         my @proteins;
-        my $top = $query->top_hit();
+        my $top = $query->get_hit(0);
 
         $peptide = $top->{peptide};
 
@@ -355,10 +363,10 @@ sub process_psm {
             $scores{peptideprophet}, '');
             
         my $inj_time = $scale_by_inj
-            ? $ms2->{scanList}->{scan}->[0]->{cvParam}->{&ION_INJECTION_TIME}->[0]->{value}
+            ? $ms2->{scanList}->{scan}->[0]->{cvParam}->{&MS_ION_INJECTION_TIME}->[0]->{value}
             : 1;
-        my @mz  = $ms2->mz();
-        my @int = map {$_ * $inj_time} $ms2->int();
+        my @mz  = @{ $ms2->mz };
+        my @int = map {$_ * $inj_time} @{ $ms2->int };
         my $baseline = min @int;
 
         my @mz_reporter_win;
@@ -389,15 +397,16 @@ sub process_psm {
             my $charge = $precursor->{charge};
 
             # get survey scan
-            $mx_parser->goto_spectrum( $precursor->{scan_id} );
+            my $scan_idx = $mx_parser->spectrum_index_by_id( $precursor->{scan_id} );
+            $mx_parser->goto_spectrum( $scan_idx );
             my $ms1_e = $mx_parser->next_spectrum();
             die "failed to fetch MS1" if (! defined $ms1_e);
 
             my $rt_e = $ms1_e->rt();
 
             # calculate initial S2I
-            my @mz  = $ms1_e->mz();
-            my @int = $ms1_e->int();
+            my @mz  = @{ $ms1_e->mz };
+            my @int = @{ $ms1_e->int };
 
             my $pre_sum = 0;
             my $all_sum = 0;
@@ -438,8 +447,8 @@ sub process_psm {
                 my $rt_l = $ms1_l->rt();
 
                 # calculate next S2I
-                my @mz  = $ms1_l->mz();
-                my @int = $ms1_l->int();
+                my @mz  = @{ $ms1_l->mz };
+                my @int = @{ $ms1_l->int };
 
                 my $pre_sum = 0;
                 my $all_sum = 0;
@@ -510,14 +519,18 @@ sub process_psm {
 
 sub load_queue  {
 
-    my ($px_parser) = @_;
+    my $px_parser;
+    {
+        lock $pepxml;
+        $px_parser = MS::Reader::PepXML->new($pepxml);
+    }
 
     RUN:
-    while (defined(my $run_idx = $px_parser->next_run_index )) {
-        my $run = $px_parser->fetch_run( $run_idx );
+    for my $run_idx (0..$px_parser->n_lists()-1) {
+        $px_parser->goto_list($run_idx);
         SPECTRUM:
-        while (my $idx = $run->next_index) {
-            $hit_queue->enqueue( [$run_idx, $idx] );
+        for (0..$px_parser->result_count()-1) {
+            $hit_queue->enqueue( [$run_idx, $_] );
         }
     }
     warn "done loading\n";
