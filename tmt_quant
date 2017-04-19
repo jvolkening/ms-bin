@@ -15,6 +15,8 @@ use threads;
 use threads::shared;
 use Thread::Queue;
 use Thread::Semaphore;
+use Statistics::R;
+use Statistics::Descriptive;
 
 use constant PROTON => elem_mass('H');
 
@@ -30,6 +32,7 @@ my $fuzzy_edges     = 0;
 my $scale_by_inj    = 0;
 my $print_obs       = 0;
 my $recal_reporters = 0;
+my $plot_reporters;
 my $sd_tol          = 3;
 my $min_int         = 0;
 my $threads         = 1;
@@ -62,6 +65,7 @@ GetOptions(
     'zero_floor'      => \$zero_floor,
     'filter_unlabeled' => \$filter_unlabeled,
     'digits=i'        => \$digits,
+    'plot_reporters=s' => \$plot_reporters,
 ) or die "Error parsing options\n";
 
 die "Tag configuration file required" if (! defined $fn_tags);
@@ -81,10 +85,27 @@ close $tags;
 my $REP_LOWER = min( map {$_->[1]} @reporters) - 1;
 my $REP_UPPER = max( map {$_->[1]} @reporters) + 1;
 
-for (@reporters) {
-    push @{ $_ },
-        $_->[1] - $reporter_tol/1000000*$_->[1],
-        $_->[1] + $reporter_tol/1000000*$_->[1];
+#for (@reporters) {
+    #push @{ $_ },
+        #$_->[1] - $reporter_tol/1000000*$_->[1],
+        #$_->[1] + $reporter_tol/1000000*$_->[1];
+#}
+for my $i (0..$#reporters) {
+    my $tol = $recal_reporters ? 25 : $reporter_tol;
+    my $lower = $reporters[$i]->[1]*(1-$tol/1000000);
+    my $upper = $reporters[$i]->[1]*(1+$tol/1000000);
+    
+    if ($i > 0) {
+        my $mid = ($reporters[$i-1]->[1] + $reporters[$i]->[1])/2;
+        $lower = $mid if ($lower < $mid);
+    }
+    if ($i < $#reporters) {
+        my $mid = ($reporters[$i]->[1] + $reporters[$i+1]->[1])/2;
+        $upper = $mid if ($upper > $mid);
+    }
+
+    $reporters[$i]->[2] = $lower;
+    $reporters[$i]->[3] = $upper;
 }
 #@reporters are now each [name, mass, lower_mass, upper_mass]
 
@@ -156,16 +177,19 @@ if (defined $impurities) {
 }
 
 if ($print_obs) {
-    for (keys %{$obs_mz}) {
-        my @observed_mz  = @{ $obs_mz->{$_}  };
-        my @observed_int = @{ $obs_int->{$_} };
+    for my $tag (keys %{$obs_mz}) {
+        my @observed_mz  = @{ $obs_mz->{$tag}  };
+        my @observed_int = @{ $obs_int->{$tag} };
         my $m = median(@observed_mz);
+        my $s = mad(@observed_mz);
+        my $n = scalar(@observed_mz);
         for (0..$#observed_mz) {
             my $mz  = $observed_mz[$_];
             my $int = $observed_int[$_];
             my $diff = $mz - $m;
-            print "$mz\t$diff\t$int\n";
+            print "$tag\t$mz\t$diff\t$int\n";
         }
+        warn "$tag\t$n\t$m\t$s\n";
     }
     exit;
 }
@@ -176,12 +200,18 @@ if ($recal_reporters) {
     for my $i (0..$#reporters) {
         my $name = $reporters[$i]->[0];
         my @observed = @{ $obs_mz->{$name} };
-        my $med = median(@observed);
-        $reporters[$i]->[1] = $med;
+        my $stat = Statistics::Descriptive::Sparse->new();
+        $stat->add_data(@observed);
+        my $mean = $stat->mean;
+        my $sd   = $stat->standard_deviation;
+        $reporters[$i]->[1] = $mean;
+        $reporters[$i]->[2] = $mean-$sd*6;
+        $reporters[$i]->[3] = $mean+$sd*6;
     }
     for my $i (0..$#reporters) {
-        my $lower = $reporters[$i]->[1]*(1-$reporter_tol*1.5/1000000);
-        my $upper = $reporters[$i]->[1]*(1+$reporter_tol*1.5/1000000);
+
+        my $lower = $reporters[$i]->[2];
+        my $upper = $reporters[$i]->[3];
         
         if ($i > 0) {
             my $mid = ($reporters[$i-1]->[1] + $reporters[$i]->[1])/2;
@@ -198,6 +228,38 @@ if ($recal_reporters) {
     }
     warn "----------------------\n";
 }
+
+if (defined $plot_reporters) {
+
+    my $R = Statistics::R->new();
+
+    # initialize PDF
+    $R->run(qq`pdf("$plot_reporters", 11, 8.5, pointsize=11, useDingbats=F)`);
+    $R->run(q`par(mfrow=c(2,5))`);
+    $R->run(q`par(mgp=c(2.2,0.7,0))`);
+    $R->run(q`par(mar=c(4,4,3.5,3.5))`);
+    $R->run(q`par(omi=c(2.5,1,2.5,1))`);
+
+    for my $tag (@reporters) {
+        my $name = $tag->[0];
+        my $lower = $tag->[2];
+        my $upper = $tag->[3];
+        my $obs = $obs_mz->{$name};
+        $R->set('mz', $obs);
+        $R->run(qq`lower <- $lower`);
+        $R->run(qq`upper <- $upper`);
+        $R->run(q`xmin <- min(lower,min(mz))`);
+        $R->run(q`xmax <- max(upper,max(mz))`);
+        $R->run(q`xlo <- xmin - (xmax-xmin)*.15`);
+        $R->run(q`xhi <- xmax + (xmax-xmin)*.15`);
+        $R->run(q`xhi <- xmax + (xmax-xmin)*.15`);
+        $R->run(qq`plot(density(mz),xlim=c(xlo,xhi),main="$name",xlab="m/z",ylab="density")`);
+        $R->run(q`abline(v=lower,col="red")`);
+        $R->run(q`abline(v=upper,col="red")`);
+    }
+    $R->run(q`dev.off()`);
+
+}    
 
 my $total_int = sum @channel_sums;
 my @scale_factors = map {$_/$total_int} @channel_sums;
@@ -339,13 +401,15 @@ sub process_psm {
 
         my $protein = $top->{protein};
         $protein =~ s/\|/_/g;
+        pos($protein) = 0;
         $protein =~ s/\.\d+$//;
         push @proteins, $protein;
 
         if (defined $top->{alternative_protein}) {
             for (@{ $top->{alternative_protein} }) {
                 my $p = $_->{protein};
-                $p =~ s/\|/_/;
+                $p =~ s/\|/_/g;
+                pos($p) = 0;
                 $p =~ s/\.\d+$//;
                 next if ($p =~ /^$decoy_tag/);
                 push @proteins, $p;
@@ -571,10 +635,20 @@ sub median {
 
     my (@vals) = @_;
     return if (scalar(@vals) < 1);
+    @vals = sort {$a <=> $b} @vals;
     my $mid_idx = int(scalar(@vals)/2);
     return scalar(@vals) % 2
         ?  $vals[$mid_idx]
         : ($vals[$mid_idx] + $vals[$mid_idx-1])/2;
+
+}
+
+sub mad {
+
+    my (@vals) = @_;
+    return if (scalar(@vals) < 1);
+    my $m = median(@vals);
+    return median( map {abs($_-$m)} @vals );
 
 }
     
