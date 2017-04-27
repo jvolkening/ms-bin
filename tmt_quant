@@ -235,10 +235,10 @@ if (defined $plot_reporters) {
 
     # initialize PDF
     $R->run(qq`pdf("$plot_reporters", 11, 8.5, pointsize=11, useDingbats=F)`);
-    $R->run(q`par(mfrow=c(2,5))`);
+    $R->run(q`par(mfrow=c(4,5))`);
     $R->run(q`par(mgp=c(2.2,0.7,0))`);
     $R->run(q`par(mar=c(4,4,3.5,3.5))`);
-    $R->run(q`par(omi=c(2.5,1,2.5,1))`);
+    $R->run(q`par(omi=c(1,1,1,1))`);
 
     for my $tag (@reporters) {
         my $name = $tag->[0];
@@ -254,6 +254,25 @@ if (defined $plot_reporters) {
         $R->run(q`xhi <- xmax + (xmax-xmin)*.15`);
         $R->run(q`xhi <- xmax + (xmax-xmin)*.15`);
         $R->run(qq`plot(density(mz),xlim=c(xlo,xhi),main="$name",xlab="m/z",ylab="density")`);
+        $R->run(q`abline(v=lower,col="red")`);
+        $R->run(q`abline(v=upper,col="red")`);
+    }
+    for my $tag (@reporters) {
+        my $name = $tag->[0];
+        my $lower = $tag->[2];
+        my $upper = $tag->[3];
+        my $obs = $obs_mz->{$name};
+        my $int = $obs_int->{$name};
+        $R->set('mz', $obs);
+        $R->set('int', $int);
+        $R->run(qq`lower <- $lower`);
+        $R->run(qq`upper <- $upper`);
+        $R->run(q`xmin <- min(lower,min(mz))`);
+        $R->run(q`xmax <- max(upper,max(mz))`);
+        $R->run(q`xlo <- xmin - (xmax-xmin)*.15`);
+        $R->run(q`xhi <- xmax + (xmax-xmin)*.15`);
+        $R->run(q`xhi <- xmax + (xmax-xmin)*.15`);
+        $R->run(qq`plot(int~mz,xlim=c(xlo,xhi),main="$name",xlab="m/z",ylab="intensity",cex=0.5,log="y")`);
         $R->run(q`abline(v=lower,col="red")`);
         $R->run(q`abline(v=upper,col="red")`);
     }
