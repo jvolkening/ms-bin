@@ -271,7 +271,6 @@ if (defined $plot_reporters) {
         $R->run(q`xmax <- max(upper,max(mz))`);
         $R->run(q`xlo <- xmin - (xmax-xmin)*.15`);
         $R->run(q`xhi <- xmax + (xmax-xmin)*.15`);
-        $R->run(q`xhi <- xmax + (xmax-xmin)*.15`);
         $R->run(qq`plot(int~mz,xlim=c(xlo,xhi),main="$name",xlab="m/z",ylab="intensity",cex=0.5,log="y")`);
         $R->run(q`abline(v=lower,col="red")`);
         $R->run(q`abline(v=upper,col="red")`);
