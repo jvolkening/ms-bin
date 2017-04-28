@@ -35,6 +35,7 @@ my $recal_reporters = 0;
 my $plot_reporters;
 my $sd_tol          = 3;
 my $min_int         = 0;
+my $min_matched     = 1;
 my $threads         = 1;
 my $decoy_tag       = 'REV_';
 my $fn_impurities;
@@ -66,6 +67,7 @@ GetOptions(
     'filter_unlabeled' => \$filter_unlabeled,
     'digits=i'        => \$digits,
     'plot_reporters=s' => \$plot_reporters,
+    'min_matched=i'   => \$min_matched,
 ) or die "Error parsing options\n";
 
 die "Tag configuration file required" if (! defined $fn_tags);
@@ -311,6 +313,13 @@ for my $spectrum (@spectra) {
     my @mz_reporter_win  = @parts[0..$mid-1];
     my @int_reporter_win = @parts[$mid..$#parts];
     my ($rep_mz,$rep_int) = extract_channels(\@mz_reporter_win, \@int_reporter_win);
+
+    # filter by minimum number of matched channels
+    if (keys %$rep_int < $min_matched) {
+        warn "Too few channels matched\n";
+        next SPECTRUM;
+    }
+
     my @values = map {defined $rep_int->{$_->[0]} ? $rep_int->{$_->[0]} : $baseline} @reporters;
     
     if (max(@values) < $min_int) {
