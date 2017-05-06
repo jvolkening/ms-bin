@@ -3,9 +3,9 @@
 use strict;
 use warnings;
 use Data::Dumper;
-use MS::Parser::MzML;
-use MS::Parser::PepXML;
-use MS::CV qw/:constants/;
+use MS::Reader::MzML;
+use MS::Reader::PepXML;
+use MS::CV qw/:MS/;
 use MS::Mass qw/elem_mass/;
 use Getopt::Long;
 use List::MoreUtils qw/uniq first_index/;
@@ -15,6 +15,8 @@ use threads;
 use threads::shared;
 use Thread::Queue;
 use Thread::Semaphore;
+use Statistics::R;
+use Statistics::Descriptive;
 
 use constant PROTON => elem_mass('H');
 
@@ -30,8 +32,10 @@ my $fuzzy_edges     = 0;
 my $scale_by_inj    = 0;
 my $print_obs       = 0;
 my $recal_reporters = 0;
+my $plot_reporters;
 my $sd_tol          = 3;
 my $min_int         = 0;
+my $min_matched     = 1;
 my $threads         = 1;
 my $decoy_tag       = 'REV_';
 my $fn_impurities;
@@ -62,6 +66,8 @@ GetOptions(
     'zero_floor'      => \$zero_floor,
     'filter_unlabeled' => \$filter_unlabeled,
     'digits=i'        => \$digits,
+    'plot_reporters=s' => \$plot_reporters,
+    'min_matched=i'   => \$min_matched,
 ) or die "Error parsing options\n";
 
 die "Tag configuration file required" if (! defined $fn_tags);
@@ -81,14 +87,31 @@ close $tags;
 my $REP_LOWER = min( map {$_->[1]} @reporters) - 1;
 my $REP_UPPER = max( map {$_->[1]} @reporters) + 1;
 
-for (@reporters) {
-    push @{ $_ },
-        $_->[1] - $reporter_tol/1000000*$_->[1],
-        $_->[1] + $reporter_tol/1000000*$_->[1];
+#for (@reporters) {
+    #push @{ $_ },
+        #$_->[1] - $reporter_tol/1000000*$_->[1],
+        #$_->[1] + $reporter_tol/1000000*$_->[1];
+#}
+for my $i (0..$#reporters) {
+    my $tol = $recal_reporters ? 25 : $reporter_tol;
+    my $lower = $reporters[$i]->[1]*(1-$tol/1000000);
+    my $upper = $reporters[$i]->[1]*(1+$tol/1000000);
+    
+    if ($i > 0) {
+        my $mid = ($reporters[$i-1]->[1] + $reporters[$i]->[1])/2;
+        $lower = $mid if ($lower < $mid);
+    }
+    if ($i < $#reporters) {
+        my $mid = ($reporters[$i]->[1] + $reporters[$i+1]->[1])/2;
+        $upper = $mid if ($upper > $mid);
+    }
+
+    $reporters[$i]->[2] = $lower;
+    $reporters[$i]->[3] = $upper;
 }
 #@reporters are now each [name, mass, lower_mass, upper_mass]
 
-my $pepxml = $ARGV[-1];
+my $pepxml :shared = $ARGV[-1];
 
 warn "Windows for first scan:\n";
 for (@reporters) {
@@ -141,7 +164,7 @@ if (defined $fn_map) {
 }
 warn "order: @output_order\n";
 
-load_queue( MS::Parser::PepXML->new($pepxml) );
+load_queue();
 
 # wait for all threads to finish
 for (@workers) {
@@ -156,16 +179,19 @@ if (defined $impurities) {
 }
 
 if ($print_obs) {
-    for (keys %{$obs_mz}) {
-        my @observed_mz  = @{ $obs_mz->{$_}  };
-        my @observed_int = @{ $obs_int->{$_} };
+    for my $tag (keys %{$obs_mz}) {
+        my @observed_mz  = @{ $obs_mz->{$tag}  };
+        my @observed_int = @{ $obs_int->{$tag} };
         my $m = median(@observed_mz);
+        my $s = mad(@observed_mz);
+        my $n = scalar(@observed_mz);
         for (0..$#observed_mz) {
             my $mz  = $observed_mz[$_];
             my $int = $observed_int[$_];
             my $diff = $mz - $m;
-            print "$mz\t$diff\t$int\n";
+            print "$tag\t$mz\t$diff\t$int\n";
         }
+        warn "$tag\t$n\t$m\t$s\n";
     }
     exit;
 }
@@ -176,12 +202,18 @@ if ($recal_reporters) {
     for my $i (0..$#reporters) {
         my $name = $reporters[$i]->[0];
         my @observed = @{ $obs_mz->{$name} };
-        my $med = median(@observed);
-        $reporters[$i]->[1] = $med;
+        my $stat = Statistics::Descriptive::Sparse->new();
+        $stat->add_data(@observed);
+        my $mean = $stat->mean;
+        my $sd   = $stat->standard_deviation;
+        $reporters[$i]->[1] = $mean;
+        $reporters[$i]->[2] = $mean-$sd*6;
+        $reporters[$i]->[3] = $mean+$sd*6;
     }
     for my $i (0..$#reporters) {
-        my $lower = $reporters[$i]->[1]*(1-$reporter_tol*1.5/1000000);
-        my $upper = $reporters[$i]->[1]*(1+$reporter_tol*1.5/1000000);
+
+        my $lower = $reporters[$i]->[2];
+        my $upper = $reporters[$i]->[3];
         
         if ($i > 0) {
             my $mid = ($reporters[$i-1]->[1] + $reporters[$i]->[1])/2;
@@ -198,6 +230,56 @@ if ($recal_reporters) {
     }
     warn "----------------------\n";
 }
+
+if (defined $plot_reporters) {
+
+    my $R = Statistics::R->new();
+
+    # initialize PDF
+    $R->run(qq`pdf("$plot_reporters", 11, 8.5, pointsize=11, useDingbats=F)`);
+    $R->run(q`par(mfrow=c(4,5))`);
+    $R->run(q`par(mgp=c(2.2,0.7,0))`);
+    $R->run(q`par(mar=c(4,4,3.5,3.5))`);
+    $R->run(q`par(omi=c(1,1,1,1))`);
+
+    for my $tag (@reporters) {
+        my $name = $tag->[0];
+        my $lower = $tag->[2];
+        my $upper = $tag->[3];
+        my $obs = $obs_mz->{$name};
+        $R->set('mz', $obs);
+        $R->run(qq`lower <- $lower`);
+        $R->run(qq`upper <- $upper`);
+        $R->run(q`xmin <- min(lower,min(mz))`);
+        $R->run(q`xmax <- max(upper,max(mz))`);
+        $R->run(q`xlo <- xmin - (xmax-xmin)*.15`);
+        $R->run(q`xhi <- xmax + (xmax-xmin)*.15`);
+        $R->run(q`xhi <- xmax + (xmax-xmin)*.15`);
+        $R->run(qq`plot(density(mz),xlim=c(xlo,xhi),main="$name",xlab="m/z",ylab="density")`);
+        $R->run(q`abline(v=lower,col="red")`);
+        $R->run(q`abline(v=upper,col="red")`);
+    }
+    for my $tag (@reporters) {
+        my $name = $tag->[0];
+        my $lower = $tag->[2];
+        my $upper = $tag->[3];
+        my $obs = $obs_mz->{$name};
+        my $int = $obs_int->{$name};
+        $R->set('mz', $obs);
+        $R->set('int', $int);
+        $R->run(qq`lower <- $lower`);
+        $R->run(qq`upper <- $upper`);
+        $R->run(q`xmin <- min(lower,min(mz))`);
+        $R->run(q`xmax <- max(upper,max(mz))`);
+        $R->run(q`xlo <- xmin - (xmax-xmin)*.15`);
+        $R->run(q`xhi <- xmax + (xmax-xmin)*.15`);
+        $R->run(qq`plot(int~mz,xlim=c(xlo,xhi),main="$name",xlab="m/z",ylab="intensity",cex=0.5,log="y")`);
+        $R->run(q`abline(v=lower,col="red")`);
+        $R->run(q`abline(v=upper,col="red")`);
+    }
+    $R->run(q`dev.off()`);
+
+}    
 
 my $total_int = sum @channel_sums;
 my @scale_factors = map {$_/$total_int} @channel_sums;
@@ -219,6 +301,7 @@ SPECTRUM:
 for my $spectrum (@spectra) {
 
     my @parts = @{$spectrum};
+
     my ($name,$prob,$peptide,$protein,$inf,$baseline,$is_ntagged,$tagged_lys)
         = splice @parts, 0, 8;
     if (! scalar(@parts)) {
@@ -230,6 +313,13 @@ for my $spectrum (@spectra) {
     my @mz_reporter_win  = @parts[0..$mid-1];
     my @int_reporter_win = @parts[$mid..$#parts];
     my ($rep_mz,$rep_int) = extract_channels(\@mz_reporter_win, \@int_reporter_win);
+
+    # filter by minimum number of matched channels
+    if (keys %$rep_int < $min_matched) {
+        warn "Too few channels matched\n";
+        next SPECTRUM;
+    }
+
     my @values = map {defined $rep_int->{$_->[0]} ? $rep_int->{$_->[0]} : $baseline} @reporters;
     
     if (max(@values) < $min_int) {
@@ -283,12 +373,18 @@ sub round {
 
 sub process_psm {
 
-    my $px_parser = MS::Parser::PepXML->new($pepxml);
+    my $px_parser;
+    {
+        lock $pepxml;
+        $px_parser = MS::Reader::PepXML->new($pepxml);
+    }
+
     my %mzml;
-    while (my $run = $px_parser->next_run) {
-        my $mzml_fn = $run->{raw_file};
+    for my $run (0..$px_parser->n_lists()-1) {
+        $px_parser->goto_list($run);
+        my $mzml_fn = $px_parser->raw_file($run);
         if (! defined $mzml{$mzml_fn}) {
-            my $mx_parser = MS::Parser::MzML->new($mzml_fn);
+            my $mx_parser = MS::Reader::MzML->new($mzml_fn);
             $mzml{$mzml_fn} = $mx_parser;
         }
     }
@@ -297,12 +393,13 @@ sub process_psm {
     while (my $hit = $hit_queue->dequeue()) {
         my ($run_idx, $query_idx) = @{ $hit };
 
-        my $run = $px_parser->fetch_run($run_idx);
-        my $query = $run->fetch_query($query_idx);
-        my $mzml_fn = $run->{raw_file};
+        $px_parser->goto_list($run_idx);
+        my $query = $px_parser->fetch_result($query_idx);
+        my $mzml_fn = $px_parser->raw_file($run_idx);
         my $mx_parser = $mzml{$mzml_fn};
-        my $scan_num = $query->{start_scan};
-        my $ms2 = $mx_parser->fetch_spectrum($scan_num);
+        my $scan_id = $query->{spectrumNativeID};
+        my $scan_idx = $mx_parser->spectrum_index_by_id($scan_id);
+        my $ms2 = $mx_parser->fetch_spectrum($scan_idx);
 
         my $inf = 'NA';
 
@@ -310,7 +407,7 @@ sub process_psm {
         my $name = $query->{spectrum};
         my $peptide;
         my @proteins;
-        my $top = $query->top_hit();
+        my $top = $query->get_hit(0);
 
         $peptide = $top->{peptide};
 
@@ -330,14 +427,16 @@ sub process_psm {
         next PEPTIDE if ($filter_unlabeled && ($is_ntagged + $tagged_lys == 0));
 
         my $protein = $top->{protein};
-        $protein =~ s/\|.*$//;
+        $protein =~ s/\|/_/g;
+        pos($protein) = 0;
         $protein =~ s/\.\d+$//;
         push @proteins, $protein;
 
         if (defined $top->{alternative_protein}) {
             for (@{ $top->{alternative_protein} }) {
                 my $p = $_->{protein};
-                $p =~ s/\|.*$//;
+                $p =~ s/\|/_/g;
+                pos($p) = 0;
                 $p =~ s/\.\d+$//;
                 next if ($p =~ /^$decoy_tag/);
                 push @proteins, $p;
@@ -355,10 +454,10 @@ sub process_psm {
             $scores{peptideprophet}, '');
             
         my $inj_time = $scale_by_inj
-            ? $ms2->{scanList}->{scan}->[0]->{cvParam}->{&ION_INJECTION_TIME}->[0]->{value}
+            ? $ms2->{scanList}->{scan}->[0]->{cvParam}->{&MS_ION_INJECTION_TIME}->[0]->{value}
             : 1;
-        my @mz  = $ms2->mz();
-        my @int = map {$_ * $inj_time} $ms2->int();
+        my @mz  = @{ $ms2->mz };
+        my @int = map {$_ * $inj_time} @{ $ms2->int };
         my $baseline = min @int;
 
         my @mz_reporter_win;
@@ -389,15 +488,16 @@ sub process_psm {
             my $charge = $precursor->{charge};
 
             # get survey scan
-            $mx_parser->goto_spectrum( $precursor->{scan_id} );
+            my $scan_idx = $mx_parser->spectrum_index_by_id( $precursor->{scan_id} );
+            $mx_parser->goto_spectrum( $scan_idx );
             my $ms1_e = $mx_parser->next_spectrum();
             die "failed to fetch MS1" if (! defined $ms1_e);
 
             my $rt_e = $ms1_e->rt();
 
             # calculate initial S2I
-            my @mz  = $ms1_e->mz();
-            my @int = $ms1_e->int();
+            my @mz  = @{ $ms1_e->mz };
+            my @int = @{ $ms1_e->int };
 
             my $pre_sum = 0;
             my $all_sum = 0;
@@ -438,8 +538,8 @@ sub process_psm {
                 my $rt_l = $ms1_l->rt();
 
                 # calculate next S2I
-                my @mz  = $ms1_l->mz();
-                my @int = $ms1_l->int();
+                my @mz  = @{ $ms1_l->mz };
+                my @int = @{ $ms1_l->int };
 
                 my $pre_sum = 0;
                 my $all_sum = 0;
@@ -510,14 +610,18 @@ sub process_psm {
 
 sub load_queue  {
 
-    my ($px_parser) = @_;
+    my $px_parser;
+    {
+        lock $pepxml;
+        $px_parser = MS::Reader::PepXML->new($pepxml);
+    }
 
     RUN:
-    while (defined(my $run_idx = $px_parser->next_run_index )) {
-        my $run = $px_parser->fetch_run( $run_idx );
+    for my $run_idx (0..$px_parser->n_lists()-1) {
+        $px_parser->goto_list($run_idx);
         SPECTRUM:
-        while (my $idx = $run->next_index) {
-            $hit_queue->enqueue( [$run_idx, $idx] );
+        for (0..$px_parser->result_count()-1) {
+            $hit_queue->enqueue( [$run_idx, $_] );
         }
     }
     warn "done loading\n";
@@ -558,10 +662,20 @@ sub median {
 
     my (@vals) = @_;
     return if (scalar(@vals) < 1);
+    @vals = sort {$a <=> $b} @vals;
     my $mid_idx = int(scalar(@vals)/2);
     return scalar(@vals) % 2
         ?  $vals[$mid_idx]
         : ($vals[$mid_idx] + $vals[$mid_idx-1])/2;
+
+}
+
+sub mad {
+
+    my (@vals) = @_;
+    return if (scalar(@vals) < 1);
+    my $m = median(@vals);
+    return median( map {abs($_-$m)} @vals );
 
 }
     
