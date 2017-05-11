@@ -2,19 +2,91 @@
 
 use strict;
 use warnings;
+use 5.012;
 
 use MS::Reader::MzML;
+use MS::Mass qw/elem_mass/;
+use Getopt::Long;
+use List::Util qw/sum/;
 
-my ($fn, $mz) = @ARGV;
+my $mzml;
+my $mass;
+my $rt_lower;
+my $rt_upper;
+my $err_ppm = 10;
+my $max_charge = 7;
 
-my $p = MS::Reader::MzML->new($fn);
+GetOptions(
+    'mzml=s'     => \$mzml,
+    'mass=f'     => \$mass,
+    'rt_lower=f' => \$rt_lower,
+    'rt_upper=f' => \$rt_upper,
+    'tol=f'      => \$err_ppm,
+    'max_charge=i' => \$max_charge,
+);
 
-my $ic = defined $mz
-    ? $p->get_xic(mz => $mz, err_ppm => 10)
-    : $p->get_tic();
+my $p = MS::Reader::MzML->new(
+    $mzml,
+    use_cache => 1,
+);
 
-my @rt  = $ic->rt;
-my @int = $ic->int;
+my $H = elem_mass('H');
 
-print "RT\tintensity\n";
-print "$rt[$_]\t$int[$_]\n" for (0..$#rt);
+my @chroms;
+my $rt;
+
+for my $z (1..$max_charge) {
+
+    warn "Z: $z\n";
+
+    my $mz = ($mass + $H*$z)/$z;
+
+    my $ic;
+
+    if (defined $rt_lower && defined $rt_upper) {
+        my $rt = ($rt_lower + $rt_upper)/2;
+        my $rt_win = $rt - $rt_lower;
+        $ic = $p->get_xic(
+                mz => $mz,
+                err_ppm => $err_ppm,
+                charge => $z,
+                iso_steps => 2,
+                rt => $rt,
+                rt_win => $rt_win,
+            );
+    }
+    else {
+        $ic = $p->get_xic(
+                mz => $mz,
+                err_ppm => $err_ppm,
+                charge => $z,
+                iso_steps => 2,
+            );
+    }
+
+    if ($z == 1) {
+        $rt = $ic->rt;
+    }
+    push @chroms, $ic->int;
+
+}
+
+for (0..$#chroms) {
+    die "length mismatch for $_\n"
+        if ( scalar(@{$chroms[$_]}) ne scalar(@{$chroms[0]}) );
+}
+
+my $f = scalar @{ $rt } ;
+say "F: $f";
+
+say join "\t",
+    'RT',
+    (map {"z" . ($_ + 1)} (0..$max_charge-1)),
+    'sum';
+for my $i (0..$#$rt) {
+    say join "\t",
+        $rt->[$i],
+        (map {$chroms[$_]->[$i]} (0..$#chroms)),
+        sum map {$chroms[$_]->[$i]} (0..$#chroms);
+}
+
