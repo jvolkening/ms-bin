@@ -77,7 +77,6 @@ for (0..$#chroms) {
 }
 
 my $f = scalar @{ $rt } ;
-say "F: $f";
 
 say join "\t",
     'RT',
