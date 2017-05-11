@@ -1,0 +1,421 @@
+#!/usr/bin/perl 
+
+eval 'exec /usr/bin/perl  -S $0 ${1+"$@"}'
+    if 0; # not running under some shell
+
+eval 'exec /usr/bin/perl  -S $0 ${1+"$@"}'
+    if 0; # not running under some shell
+
+#---------------------------------------------------------------------------#
+# Author: Jeremy Volkening, UW-Madison Biotechnology Center
+# Copyright 2015 Jeremy Volkening
+#
+# This software is licensed under the GNU Public License v3 (GPLv3)
+#
+# Some aspects of the Mascot Server interaction were deduced from:
+#
+#      daemon2MIME.pl, etc
+#      Author: Simon Michnowicz 26/10/11
+#---------------------------------------------------------------------------#
+
+use strict;
+use warnings;
+use autodie;
+
+use File::Basename;
+use File::Copy;
+use File::Temp;
+use File::Which;
+use Getopt::Long;
+use Pod::Usage;
+use Readonly;
+use LWP;
+use LWP::UserAgent;
+use HTTP::Request::Common;
+
+my $mascot_host;
+my $fn_mgf;
+my $fn_mzml;
+my $fn_params;
+my $fn_out;
+my $timeout = 180;
+my $print_warnings;
+my $run_name;
+
+GetOptions(
+    'host=s'     => \$mascot_host,
+    'mgf=s'      => \$fn_mgf,
+    'mzml=s'     => \$fn_mzml,
+    'param=s'    => \$fn_params,
+    'out=s'      => \$fn_out,
+    'timeout=i'  => \$timeout,
+    'warnings'   => \$print_warnings,
+    'run_name=s' => \$run_name,
+    'help'       => sub {pod2usage( -verbose => 2 )},
+) or die "bad parameters";
+
+pod2usage( -msg => 'Exactly one of "--mgf" or "--mzml" must be specified as input' )
+    if ( (! defined $fn_mgf && ! defined $fn_mzml)
+      || (  defined $fn_mgf &&   defined $fn_mzml) );
+
+my $m = 'Incorrect or incomplete parameters';
+pod2usage( -msg => $m ) if (! defined $fn_params || ! -r $fn_params);
+pod2usage( -msg => $m ) if (! defined $mascot_host);
+pod2usage( -msg => $m ) if (! defined $fn_out);
+
+# CONSTANTS
+Readonly my $PROGRAM => 'mascot_client';
+Readonly my $VERSION => '0.2.1';
+
+# creates a psedo-random boundary string for MIME
+Readonly my $BOUNDARY    => join('',map {unpack "H*", chr(rand(256)) } 1..16);
+Readonly my $CRLF        => "\r\n";
+Readonly my $MIME_PREFIX =>'Content-Disposition: form-data; name=';
+
+# define or search for binary locations
+Readonly my $GZIPBIN     => which('pigz')   // which('gzip');
+Readonly my $BZIP2BIN    => which('pbzip2') // which('bzip2');
+Readonly my $MZML2MGFBIN => which('mzml2mgf');
+
+$HTTP::Request::Common::DYNAMIC_FILE_UPLOAD = 1;
+
+my $ua =  LWP::UserAgent->new(
+    'agent'   => "$PROGRAM/$VERSION",
+    'timeout' => $timeout,
+);
+
+#############################################################################
+# prepare and submit search data
+#############################################################################
+
+my $basename = defined $fn_mgf ? basename($fn_mgf)
+                               : basename($fn_mzml);
+my $tmp_mime = File::Temp->new();
+
+open my $fh_params,    '<', $fn_params;
+my $fh_spectrum = open_flex();
+
+# parse daemon params file
+my @params;
+while (my $line = <$fh_params>) {
+    $line =~ s/[\r\n]//g;
+    my @segments = split '=', $line;
+    $segments[1] = $run_name 
+        if ($segments[0] eq 'COM' && defined $run_name);
+    push(@segments,'') if (@segments == 1);
+    die "ERROR, bad parameter: $line" if (@segments > 2);
+    push @params, [@segments];
+}
+    
+# add common parameters
+my @hidden_vals = (
+    [ 'FORMVER'      => '1.01'    ],
+    [ 'INTERMEDIATE' => ''        ],
+    [ 'REPTYPE'      => 'peptide' ],
+    [ 'ErrTolRepeat' => '0'       ],
+);
+push @params, @hidden_vals;
+
+_print_param($tmp_mime, @{$_}) for (@params);
+
+# add the MGF file
+print {$tmp_mime} "--$BOUNDARY$CRLF"
+                . "$MIME_PREFIX\"FILE\"; filename=\"$basename\"$CRLF"
+                . "Content-Type: application/download$CRLF$CRLF";
+print {$tmp_mime} $_ while (<$fh_spectrum>);
+print {$tmp_mime} "$CRLF--$BOUNDARY--$CRLF";
+close $fh_spectrum;
+close $fh_params;
+close $tmp_mime;
+#seek $tmp_mime, 0, 0;
+
+my $upload_bytes = -s $tmp_mime->filename;
+
+# prepare request
+my $uri = "$mascot_host/mascot/cgi/nph-mascot.exe?1";
+my $req = POST $uri,
+    'Content_Type' => "multipart/form-data; boundary=\"$BOUNDARY\"",
+    'Content'      => [ fn => [$tmp_mime->filename] ],
+;
+
+my $gen = $req->content;
+die "not code ref" unless ref($gen) eq 'CODE';
+my $uploaded = 0;
+my $last_completed = 0;
+$req->content(
+    sub {
+        my $chunk = &$gen();
+        $uploaded += length($chunk) if (defined $chunk);
+        my $completed = int($uploaded/$upload_bytes*100);
+        if ($completed > $last_completed) {
+            print progress_bar("Uploading",$completed);
+            $last_completed = $completed;
+        }
+        return $chunk;
+    }
+);
+
+my @warnings;
+
+my $start = time;
+
+$| = 1;
+
+my $content = '';
+my $res = $ua->request(
+    $req,
+    sub {
+        my($data,$response,$proto) = @_;
+        $content .= $data;
+        if ($content =~ /^\.*(\d+)\% complete<BR>/ms) {
+            $content = substr $content, $+[0];
+            my $completed = $1;
+            print progress_bar("Searching", $completed);
+            #print "\n" if ($completed == 100);
+        }
+        elsif ($content =~ /^(Warning:<BR>.+?<BR>)/ms) {
+            my $w = $1;
+            $content = substr $content, $+[0];
+            $w =~ s/<BR>//g;
+            push @warnings, $w;
+        }
+        return 1;
+
+    },
+    16
+
+);
+$tmp_mime->close;
+
+#print "\n";
+my $elapsed = time - $start;
+if (! $res->is_success) { # on failure
+    die "Error searching file: ", $res->status_line, "\n";
+}
+
+#check for results file path at end of run
+my ($date_dir, $res_file);
+if ($content =~ /\<A HREF\=.+?\?file\=\.\.\/data\/(\d+)\/([^\"]+)\"\>Click here to see Search Report/) {
+    $date_dir = $1;
+    $res_file = $2;
+}
+if (! defined $date_dir || ! defined $res_file) {
+    warn "\n$content\n";
+    die "Unable to determine results directory or filename\n";
+}
+#print "Run took $elapsed seconds\n";
+#print "Result directory: $date_dir\n";
+#print "Result file: $res_file\n";
+if (@warnings && $print_warnings) {
+    print "\nThe following warnings were received:\n";
+    print "\t$_\n" for (@warnings);
+}
+
+#return ($date_dir,$res_file);
+
+
+#############################################################################
+# fetch search results
+#############################################################################
+
+# set up request
+$uri = "$mascot_host/mascot/x-cgi/ms-status.exe";
+$uri .= "?Autorefresh=false&Show=RESULTFILE&DateDir=$date_dir&ResJob=$res_file&BrowserSafe=true";
+my $tmp_file = $fn_out . '.partial';
+
+open my $out, '>', $tmp_file;
+# proceed with download
+my $fetched_size = 0;
+my $last_size = 0;
+$res = $ua->get(
+    $uri,
+    ':content_cb' => sub {
+        my($data, $response, $proto) = @_;
+        $fetched_size += length($data);
+        my $str = fmt_size($fetched_size);
+        if ($str ne $last_size) {
+            print "Downloading ($str)         \r";
+            $last_size = $str;
+        }
+        print {$out} $data;
+    },
+);
+print "\n";
+if (! $res->is_success) { # on failure
+    die "Error transfering file: ", $res->status_line, "\n";
+}
+move($tmp_file, $fn_out) or die "error moving file: $!";
+print "Finished successfully\n";
+exit 0;
+
+#############################################################################
+# subroutines
+#############################################################################
+
+sub fmt_size {
+
+    my $val = shift;
+    my @units = qw/B KB MB GB TB/;
+    my $unit = shift @units;
+    while ($val > 2**10) {
+        die "size too big" if (@units < 1);
+        $val = int($val/2**10);
+        $unit = shift @units;
+    }
+    return "$val $unit"
+
+}
+
+sub _print_param {
+
+    my ($fh, $key, $val) = @_;
+    print {$fh}  "--$BOUNDARY$CRLF"
+               . "$MIME_PREFIX\"$key\"$CRLF$CRLF$val$CRLF";
+
+}
+
+sub progress_bar {
+
+    my ( $name, $frac, $width, $char ) = @_;
+    $width = $width // 25;
+    $char  = $char  // '=';
+    return sprintf "|%-${width}s| %s (%.0f%%)\r", 
+        $char x (($width-1)*$frac/100). '>', 
+        $name, $frac;
+
+}
+
+# open filehandle, detecting compression if present
+sub open_flex {
+
+    my $fh;
+
+    if (defined $fn_mgf) {
+
+        open $fh, '<', $fn_mgf or die "Error opening $fn_mgf for reading\n";
+
+        binmode($fh);
+        my @bytes;
+        my $byte;
+        for (0..2) {
+            sysread($fh,$byte,1);
+            push @bytes, ord($byte);
+        }
+
+        # check for gzip
+        if ($bytes[0] == 0x1f && $bytes[1] == 0x8b && $bytes[2] == 0x08) {
+            close $fh;
+            die "No executable found to decompress gzip files\n"
+                if (! defined $GZIPBIN);
+            open $fh, "$GZIPBIN -dc $fn_mgf |" or die "Error opening gzip stream: $!\n";
+        }
+
+        # check for bzip2
+        elsif ($bytes[0] == 0x42 && $bytes[1] == 0x5a && $bytes[2] == 0x68) {
+            close $fh;
+            die "No executable found to decompress bzip2 files\n"
+                if (! defined $BZIP2BIN);
+            open $fh, "$BZIP2BIN -dc $fn_mgf |" or die "Error opening bzip2 stream: $!\n";
+        }
+
+        # otherwise just reset filehandle
+        else {
+            binmode($fh,':crlf'); 
+            seek($fh,0,0);
+        }
+
+    }
+
+    elsif (defined $fn_mzml) {
+
+        die "Required converter mzml2mgf not found"
+            if (! defined $MZML2MGFBIN);
+        open $fh, "$MZML2MGFBIN $fn_mzml |" or die "Error opening pipe to mzml2mgf";
+
+    }
+
+    return $fh;
+
+}
+
+__END__
+
+=head1 NAME
+
+mascot_client - submit search and retrieve results from Mascot server
+
+=head1 VERSION
+
+This documentation refers to mascot_client version 0.2a
+
+=head1 USAGE
+
+mascot_client --host <http://mascothost> --mgf F<data.mgf> --param F<params.par> --out F<results.dat>
+
+=head1 REQUIRED ARGUMENTS
+
+=over 4
+
+=item B<--host> hostname
+
+Mascot Server hostname (including 'http://')
+
+=item B<--socks> hostname:port
+
+Optionally use a SOCKS proxy to connect
+
+=item B<--mgf> F<filename>
+
+Spectra in MGF (Mascot Generic Format)
+
+=item B<--param> F<filename>
+
+Search parameters in Mascot Daemon-compatible format
+
+=item B<--out> F<filename>
+
+Pathname where results file will be copied
+
+=item B<--run_name> F<filename>
+
+Name used to fill in 'COM' search parameter
+
+=back
+
+=head1 DESCRIPTION
+
+mascot_client combines an MGF spectra file and a parameters file
+(probably generated by Mascot Daemon) into a format suitable for
+submission to a web-based Mascot server. It will wait for search
+completion and then retrieve and store the results in the location
+specified.
+
+=head1 DIAGNOSTICS
+
+=head1 DEPENDENCIES
+
+=head1 BUGS AND LIMITATIONS
+
+None currently outstanding. Please notify the authors of any bugs found.
+
+=head1 AUTHOR
+
+Jeremy Volkening
+
+=head1 LICENSE AND COPYRIGHT
+
+Copyright 2012 Sussman Laboratory, University of Wisconsin-Madison
+
+This program is free software: you can redistribute it and/or modify
+it under the terms of the GNU General Public License as published by
+the Free Software Foundation, either version 3 of the License, or
+(at your option) any later version.
+
+This program is distributed in the hope that it will be useful,
+but WITHOUT ANY WARRANTY; without even the implied warranty of
+MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+GNU General Public License for more details.
+
+You should have received a copy of the GNU General Public License
+along with this program.  If not, see <http://www.gnu.org/licenses/>.
+

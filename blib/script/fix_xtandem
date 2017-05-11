@@ -1,0 +1,37 @@
+#!/usr/bin/perl 
+
+eval 'exec /usr/bin/perl  -S $0 ${1+"$@"}'
+    if 0; # not running under some shell
+
+use strict;
+use warnings;
+use File::Copy qw/move/;
+
+my @files = @ARGV;
+
+for my $file (@files) {
+    my $mod = 0; 
+    my $tmp = $file . '.tmp';
+    open my $in, '<', $file or die "Error opening input\n";
+    open my $out, '>', $tmp or die "Error opening output\n";
+    while (my $line = <$in>) {
+        if ($line =~ /^\s*<spectrum_query[\s>]/) {
+            if ($line =~ /\sspectrum="([^"]+\.(\d+)\.(\d+)\.\d+) RTINSECONDS/) {
+                my $id = $1;
+                my $start = $2;
+                my $end = $2;
+                die "mismatch $start $end\n" if ($start != $end);
+                $mod += $line =~ s/(?<=\sspectrum=")[^"]+/$id/;
+                $line =~ s/(?<=\sstart_scan=")[^"]+/$start/;
+                $line =~ s/(?<=\send_scan=")[^"]+/$end/;
+            }
+            else {
+                die "bad scan line $line";
+            }
+        }
+        print {$out} $line;
+    }
+    warn "$mod\t$file\n";
+    move($tmp => $file);
+}
+            
