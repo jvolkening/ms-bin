@@ -73,21 +73,15 @@ while (my $grp = $p->next_group) {
     PROT:
     for my $prot (@{ $grp->{protein} }) {
 
-        next PROT if ($prot->{probability} < $min_prob);
-
-        my $n_prot = $prot->{n_indistinguishable_proteins};
-        if ($n_prot > 1) {
-            warn "too many proteins for $prot->{protein_name}\n";
-            next GROUP;
-        }
-        my $name = $prot->{protein_name};
-        my $cov  = $prot->{percent_coverage};
-        die "FOO! $grp->{group_number}\n" if (! defined $cov);
-        my $frac = $prot->{pct_spectrum_ids};
-        die "BAR! $grp->{group_number}\n" if (! defined $frac);
         my $prob = $prot->{probability};
+        next PROT if ($prob < $min_prob);
+
         my $n_peps = $prot->{total_number_distinct_peptides};
         next PROT if ($n_peps < $min_peps);
+
+        my $name = $prot->{protein_name};
+        my $cov  = $prot->{percent_coverage};
+        my $frac = $prot->{pct_spectrum_ids};
         say join "\t",
             $name,
             $prob,
