@@ -1,0 +1,101 @@
+#!/usr/bin/perl
+
+use strict;
+use warnings;
+use 5.012;
+
+use Cwd qw/abs_path/;
+use File::Basename qw/basename/;
+use File::Copy qw/copy/;
+use File::Temp qw/tempdir/;
+use Getopt::Long;
+use MS::Reader::ProtXML;
+
+#xinteract -dDECOY_ -D../../search_db/9A20_6A5.search.fa -THREADS=30 -OPp -NpA JDV_PoolA_run3.pep.xml
+
+my $decoy_tag = 'REV_';
+my $force     = 0;
+my $db;
+my $keep_meta;
+my $expect_only;
+my $no_mass;
+my $n_threads = 1;
+my $min_prob = $ARGV[1] // 0.95;
+my $min_peps = 2;
+
+GetOptions(
+    'decoy_tag=s' => \$decoy_tag,
+    'db=s'        => \$db,
+    'force'       => \$force,
+    'expect_only' => \$expect_only,
+    'no_mass'     => \$no_mass,
+    'threads=i'   => \$n_threads,
+    'min_peps=i'  => \$min_peps,
+    'min_prob=f'  => \$min_prob,
+);
+
+my @files = @ARGV;
+die "missing input file name(s)\n" if (scalar(@files) < 1);
+for (@files) {
+    die "bad input file: $_\n" if (! -r $_);
+ }
+
+my $pp_flags = '-OPp';
+$pp_flags .= 'F' if ($force);
+$pp_flags .= 'E' if ($expect_only);
+$pp_flags .= 'k' if ($no_mass);
+
+$db = abs_path($db);
+@files = map {abs_path($_)} @files;
+
+my $tmpdir = tempdir(cleanup => 0);
+chdir $tmpdir;
+my @tmpfiles;
+for (@files) {
+    my $base = basename($_);
+    push @tmpfiles, $base;
+    copy $_, $base
+        or die "Error linking $_ to $base: $!\n";
+}
+
+my $res = system("xinteract $pp_flags -d$decoy_tag -THREADS=$n_threads -D$db @tmpfiles 1>&2");
+die "Error running PeptideProphet\n" if ($res);
+
+die "Can't find or read output file\n"
+    if (! -r 'interact.prot.xml');
+my $p = MS::Reader::ProtXML->new('interact.prot.xml');
+
+GROUP:
+while (my $grp = $p->next_group) {
+
+    next GROUP if ($grp->{probability} < $min_prob);
+
+    PROT:
+    for my $prot (@{ $grp->{protein} }) {
+
+        next PROT if ($prot->{probability} < $min_prob);
+
+        my $n_prot = $prot->{n_indistinguishable_proteins};
+        if ($n_prot > 1) {
+            warn "too many proteins for $prot->{protein_name}\n";
+            next GROUP;
+        }
+        my $name = $prot->{protein_name};
+        my $cov  = $prot->{percent_coverage};
+        die "FOO! $grp->{group_number}\n" if (! defined $cov);
+        my $frac = $prot->{pct_spectrum_ids};
+        die "BAR! $grp->{group_number}\n" if (! defined $frac);
+        my $prob = $prot->{probability};
+        my $n_peps = $prot->{total_number_distinct_peptides};
+        next PROT if ($n_peps < $min_peps);
+        say join "\t",
+            $name,
+            $prob,
+            $cov,
+            $frac,
+            $n_peps,
+        ;
+    }
+}
+
+exit;
