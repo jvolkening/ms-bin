@@ -6,6 +6,7 @@ use 5.012;
 
 use Getopt::Long;
 use List::Util qw/sum/;
+use List::MoreUtils qw/uniq/;
 
 use constant FLOAT_TOL => 0.000001;
 
@@ -17,6 +18,7 @@ my $min_mass  = 600;
 my $tol       = 10;
 my $by_charge = 0;
 my $method    = 'trapezoid'; # 'trapezoid' or 'sum'
+my $fn_pepxml;
 
 GetOptions(
     'max_gaps=i'  => \$max_gaps,
@@ -26,6 +28,7 @@ GetOptions(
     'min_mass=f'  => \$min_mass,
     'by_charge'   => \$by_charge,
     'method=s'    => \$method,
+    'pepxml=s'    => \$fn_pepxml,
     'tol=f'       => \$tol,
 );
 
@@ -35,6 +38,43 @@ my $index_curr = 0;
 
 my @candidates;
 my @finalized;
+
+#parse peptide IDS if given
+
+my @ids;
+
+if (defined $fn_pepxml) {
+
+    require MS::Reader::PepXML;
+
+    my $p = MS::Reader::PepXML->new($fn_pepxml);
+
+    my $n = $p->n_lists;
+    for (0..$n-1) {
+        $p->goto_list($_);
+        while (my $result = $p->next_result) {
+            my $hit = $result->get_hit(0);
+            my $mass = $hit->{calc_neutral_pep_mass}
+                // die "missing neutral mass";
+            my $rt = $result->{retention_time_sec}
+                // die "missing retention time";
+            $rt /= 60; # report in minutes
+            my $pep = $hit->{peptide}
+                // die "missing peptide sequence";
+            push @ids, {
+                mass => $mass,
+                rt   => $rt,
+                pep  => $pep,
+            };
+            
+        }
+    }
+
+}
+
+# sort IDs by mass
+@ids = sort {$a->{mass} <=> $b->{mass}} @ids;
+
 
 LINE:
 while (my $line = <STDIN>) {
@@ -155,7 +195,7 @@ for my $cand (@candidates) {
 
 }
 
-@finalized = sort {$a->{first_scan} <=> $b->{first_scan}} @finalized;
+@finalized = sort {$a->{mass} <=> $b->{mass}} @finalized;
 
 # print header
 say join "\t", qw/
@@ -169,18 +209,22 @@ say join "\t", qw/
     first_rt
     last_rt
     peak_rt
+    n_psms
+    peptide
     z_dist
     profiles
 /;
 
-CANDIDATE:
-for my $cand (@finalized) {
+my $id_start = 0;
 
-    my %int_sums = %{ $cand->{int_sums} };
+FEATURE:
+for my $feat (@finalized) {
+
+    my %int_sums = %{ $feat->{int_sums} };
     my $sum_sums = sum values %int_sums;
 
-    my @zs  = sort {$a <=> $b} keys %{ $cand->{ints}     };
-    my @rts = sort {$a <=> $b} keys %{ $cand->{int_sums} };
+    my @zs  = sort {$a <=> $b} keys %{ $feat->{ints}     };
+    my @rts = sort {$a <=> $b} keys %{ $feat->{int_sums} };
 
     my $quant = $sum_sums;
 
@@ -189,15 +233,15 @@ for my $cand (@finalized) {
 
         my $integrated = 0;
         if (@rts < 2) {
-            $integrated = $cand->{int_sums}->{$rts[0]};
+            $integrated = $feat->{int_sums}->{$rts[0]};
         }
         else {
             for (1..$#rts) {
                 my $r1 = $rts[$_-1];
                 my $r2 = $rts[$_];
                 $integrated +=
-                    ($cand->{int_sums}->{$r1}
-                    + $cand->{int_sums}->{$r2}) / 2
+                    ($feat->{int_sums}->{$r1}
+                    + $feat->{int_sums}->{$r2}) / 2
                     *($r2 - $r1);
             }
         }
@@ -209,32 +253,58 @@ for my $cand (@finalized) {
     for my $z (@zs) {
         my $total;
         for my $rt (@rts) {
-            $total += $cand->{ints}->{$z}->{$rt}
-                if (defined $cand->{ints}->{$z}->{$rt});
+            $total += $feat->{ints}->{$z}->{$rt}
+                if (defined $feat->{ints}->{$z}->{$rt});
         }
         $fracs{$z} = sprintf '%0.3f', $total / $sum_sums;
     }
 
     my @int_strings;
     for my $z (@zs) {
-        my @points = map {[ $_ => $cand->{ints}->{$z}->{$_} ]}
-            grep {defined $cand->{ints}->{$z}->{$_}} @rts;
+        my @points = map {[ $_ => $feat->{ints}->{$z}->{$_} ]}
+            grep {defined $feat->{ints}->{$z}->{$_}} @rts;
         @points = sort {$a->[0] <=> $b->[0]} @points;
         push @int_strings, "$z:" .
             join(',', map {$_->[0], $_->[1]} @points);
     }
 
+    # check for peptide match
+    my $mz_lower = $feat->{mass} - $feat->{mass}*$tol/1000000;
+    my $mz_upper = $feat->{mass} + $feat->{mass}*$tol/1000000;
+    my $rt_lower = $feat->{first_rt};
+    my $rt_upper = $feat->{last_rt};
+
+    my @pep_hits;
+
+    ID:
+    for my $i ($id_start..$#ids) {
+
+        my $id = $ids[$i];
+        if ($id->{mass} < $mz_lower) {
+            $id_start = $i+1;
+            next ID;
+        }
+        last ID if ($id->{mass} > $mz_upper);
+        next ID if ($id->{rt} < $rt_lower - FLOAT_TOL
+                 || $id->{rt} > $rt_upper + FLOAT_TOL);
+        push @pep_hits, $id->{pep};
+    } 
+
+    my $n_psm = scalar @pep_hits;
+
     say join "\t",
-        $cand->{first_scan},  
-        $cand->{last_scan},  
-        $cand->{last_index} - $cand->{first_index} + 1,
-        $cand->{n_scans},  
+        $feat->{first_scan},  
+        $feat->{last_scan},  
+        $feat->{last_index} - $feat->{first_index} + 1,
+        $feat->{n_scans},  
         join(',', @zs),
-        $cand->{mass},
-        $quant,,
-        $cand->{first_rt},  
-        $cand->{last_rt},
-        $cand->{max_rt},
+        $feat->{mass},
+        $quant,
+        $feat->{first_rt},  
+        $feat->{last_rt},
+        $feat->{max_rt},
+        $n_psm,
+        join( '|', uniq @pep_hits),
         join( '|', map {"$_:$fracs{$_}"} keys %fracs ),
         join( '|', @int_strings );
 
