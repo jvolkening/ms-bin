@@ -23,7 +23,7 @@ use Statistics::Descriptive;
 
 use constant PROTON => elem_mass('H');
 
-our $VERSION = 0.009;
+our $VERSION = 0.010;
 
 my $fn_tags;
 my $correct_coelute = 0;
@@ -375,6 +375,9 @@ print join "\t", qw/
     id
     probability
     peptide
+    mz
+    charge
+    full_peptide
     protein
     coelute_inf
     is_ntagged
@@ -393,8 +396,8 @@ for my $spectrum (@spectra) {
 
     my @parts = @{$spectrum};
 
-    my ($run, $name,$prob,$peptide,$protein,$inf,$baseline,$is_ntagged,$tagged_lys)
-        = splice @parts, 0, 9;
+    my ($run, $name,$prob,$peptide,$mz,$charge,$full_peptide,$protein,$inf,$baseline,$is_ntagged,$tagged_lys)
+        = splice @parts, 0, 12;
     if (! scalar(@parts)) {
         ++$n_empty;
         #warn "empty reporter window\n";
@@ -443,7 +446,7 @@ for my $spectrum (@spectra) {
         @interferences = map {$_ * $sum_interference} @scale_factors;
     }
 
-    my $print_string = "$name\t$prob\t$peptide\t$protein\t$inf\t$is_ntagged\t$tagged_lys";
+    my $print_string = "$name\t$prob\t$peptide\t$mz\t$charge\t$full_peptide\t$protein\t$inf\t$is_ntagged\t$tagged_lys";
     for (0..$#reporters) {
         my $int  = $values[$_] - $interferences[$_];
         $int = 0 if ($int < 0 && $zero_floor);
@@ -516,11 +519,33 @@ sub process_psm {
 
         #extract peptide and protein group string
         my $name = $query->{spectrum};
-        my $peptide;
+        my $z    = $query->{assumed_charge};
+        my $mz   = sprintf "%0.4f", $ms2->precursor()->{mono_mz};
+
         my @proteins;
         my $top = $query->get_hit(0);
 
-        $peptide = $top->{peptide};
+        my $peptide = $top->{peptide};
+
+        my $full_peptide = $peptide;
+        my $offset = 0;
+        if (defined $top->{modification_info}->{mod_nterm_mass}) {
+            my $tag = sprintf("n[%.0f]", $top->{modification_info}->{mod_nterm_mass});
+            substr $full_peptide, 0, 0, $tag;
+            $offset += length($tag);
+        }
+        if (defined $top->{modification_info}->{mod_aminoacid_mass}) {
+            for ( sort {$a->{position} <=> $b->{position}} @{ $top->{modification_info}->{mod_aminoacid_mass} } ) {
+                my $tag = sprintf("[%.0f]", $_->{mass});
+                substr $full_peptide, $_->{position}+$offset, 0, $tag;
+                $offset += length($tag);
+            }
+        }
+        $full_peptide = join '.',
+            $top->{peptide_prev_aa},
+            $full_peptide,
+            $top->{peptide_next_aa},
+        ;
 
         my $nterm_mod = $top->{modification_info}->{mod_nterm_mass};
         my $is_ntagged = 0;
@@ -711,8 +736,22 @@ sub process_psm {
         }
         {
             lock @spectra;
-            my @sp = ($run_idx, $name, $prob, $peptide, $protein, $inf, $baseline, $is_ntagged,
-                $tagged_lys, @mz_reporter_win, @int_reporter_win);
+            my @sp = (
+                $run_idx,
+                $name,
+                $prob,
+                $peptide,
+                $mz,
+                $z,
+                $full_peptide,
+                $protein,
+                $inf,
+                $baseline,
+                $is_ntagged,
+                $tagged_lys,
+                @mz_reporter_win,
+                @int_reporter_win,
+            );
             push @spectra, shared_clone([@sp]);
         }
 
