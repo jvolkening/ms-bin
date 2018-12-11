@@ -16,13 +16,14 @@ my $expect_only;
 my $no_mass;
 
 GetOptions(
-    'decoy_tag=s' => \$decoy_tag,
-    'out=s'       => \$out,
-    'db=s'        => \$db,
-    'force'       => \$force,
-    'keep_meta'   => \$keep_meta,
-    'expect_only' => \$expect_only,
-    'no_mass'     => \$no_mass,
+    'decoy_tag=s'   => \$decoy_tag,
+    'out=s'         => \$out,
+    'db=s'          => \$db,
+    'force'         => \$force,
+    'keep_meta'     => \$keep_meta,
+    'expect_only'   => \$expect_only,
+    'no_mass'       => \$no_mass,
+    'keep_asterisk' => \$keep_asterisk,
 );
 
 my @files = @ARGV;
@@ -47,6 +48,7 @@ my $pp_flags = '-OAPtud';
 $pp_flags .= 'F' if ($force);
 $pp_flags .= 'E' if ($expect_only);
 $pp_flags .= 'k' if ($no_mass);
+$pp_flags .= 'l' if ($keep_asterisk);
 my $res = system("xinteract -p0 $pp_flags -N$out -d$decoy_tag -D$db @files");
 die "Error running PeptideProphet\n" if ($res);
 if (! $keep_meta) {
