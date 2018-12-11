@@ -14,6 +14,7 @@ my $db;
 my $keep_meta;
 my $expect_only;
 my $no_mass;
+my $keep_asterisk;
 
 GetOptions(
     'decoy_tag=s'   => \$decoy_tag,
