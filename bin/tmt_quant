@@ -5,6 +5,8 @@ use strict;
 use warnings;
 use 5.012;
 
+use autodie;
+
 use Data::Dumper;
 use MS::Reader::MzML;
 use MS::Reader::PepXML;
@@ -73,8 +75,8 @@ GetOptions(
     'plot_reporters=s'  => \$plot_reporters,
     'min_matched=i'     => \$min_matched,
     'subtract_baseline' => \$subtract_baseline,
-    'q-value'           => \$q_cutoff,
-    'percolator'        => \$fn_perc,
+    'q-value=f'         => \$q_cutoff,
+    'percolator=s'      => \$fn_perc,
 ) or die "Error parsing options\n";
 
 
@@ -123,8 +125,8 @@ for my $i (0..$#reporters) {
     }
 
     for (0..$n_runs-1) {
-        $reporters[$i]->{$_}->{lower} = $lower;
-        $reporters[$i]->{$_}->{upper} = $upper;
+        $reporters[$i]->{$_}->{lower} = sprintf "%0.7f", $lower;
+        $reporters[$i]->{$_}->{upper} = sprintf "%0.7f", $upper;
     }
 }
 
@@ -157,6 +159,21 @@ if (defined $fn_impurities) {
     $impurities = Math::Matrix->new( @m )->transpose;
 }
 
+# load separate percolator table if given
+my %qvals = defined $fn_perc
+    ? parse_percolator()
+    : ();
+
+# track PSM status
+my $n_spectra                 = 0;
+my $n_passed                  = 0;
+my $n_empty                   = 0;
+my $n_failed_min_channels     = 0;
+my $n_failed_min_int          = 0;
+my $n_failed_coelute          = 0;
+my $n_no_matches :shared      = 0;
+my $n_failed_q_cutoff :shared = 0;
+
 # track reporter mass error for summary purposes
 my @obs_mz  = map { {map {$_->{name} => []} @reporters} } 0..($n_runs-1);
 my @obs_int = map { {map {$_->{name} => []} @reporters} } 0..($n_runs-1);
@@ -173,12 +190,8 @@ for (1..$threads) {
     push @workers, threads->create(\&process_psm);
 }
 
-# load separate percolator table if given
-my %qvals :shared = defined $fn_perc
-    ? parse_percolator()
-    : ();
 
-load_queue();
+$n_spectra = load_queue();
 
 # wait for all threads to finish
 for (@workers) {
@@ -225,9 +238,9 @@ if ($recal_reporters) {
             $stat->add_data(@observed);
             my $mean = $stat->mean;
             my $sd   = $stat->standard_deviation;
-            $tag->{$run}->{center} = $mean;
-            $tag->{$run}->{lower}  = $mean-$sd*6;
-            $tag->{$run}->{upper}  = $mean+$sd*6;
+            $tag->{$run}->{center} = sprintf "%0.7f", $mean;
+            $tag->{$run}->{lower}  = sprintf "%0.7f", $mean-$sd*6;
+            $tag->{$run}->{upper}  = sprintf "%0.7f", $mean+$sd*6;
         }
     }
 
@@ -254,8 +267,8 @@ if ($recal_reporters) {
                 $upper = $mid if ($upper > $mid);
             }
 
-            $reporters[$i]->{$run}->{lower} = $lower;
-            $reporters[$i]->{$run}->{upper} = $upper;
+            $reporters[$i]->{$run}->{lower} = sprintf "%0.7f", $lower;
+            $reporters[$i]->{$run}->{upper} = sprintf "%0.7f", $upper;
             warn join("\t",
                 $name,
                 "run $run",
@@ -393,12 +406,6 @@ print join "\t", qw/
     /;
 say "\t", join( "\t", map {$_->{name}} @reporters );
 
-my $n_spectra = scalar(@spectra);
-my $n_passed              = 0;
-my $n_empty               = 0;
-my $n_failed_min_channels = 0;
-my $n_failed_min_int      = 0;
-
 SPECTRUM:
 for my $spectrum (@spectra) {
 
@@ -438,7 +445,10 @@ for my $spectrum (@spectra) {
         next SPECTRUM;
     }
 
-    next SPECTRUM if ($max_coelute && $inf > $max_coelute);
+    if ($max_coelute && $inf > $max_coelute) {
+        ++$n_failed_coelute;
+        next SPECTRUM;
+    }
 
     # correct channel sums for impurities
     if (defined $impurities) {
@@ -472,11 +482,14 @@ for my $spectrum (@spectra) {
 
 warn "Summary:\n";
 warn "----------------------\n";
-warn "Total spectra:        $n_spectra\n";
-warn "Empty window:         $n_empty\n";
-warn "Failed min channels:  $n_failed_min_channels\n";
-warn "Failed min intensity: $n_failed_min_int\n";
-warn "Passing spectra:      $n_passed\n";
+warn "Total spectra:             $n_spectra\n";
+warn "No matches:                $n_no_matches\n";
+warn "Failed FDR cutoff:         $n_failed_q_cutoff\n";
+warn "Failed coisolation cutoff: $n_failed_coelute\n";
+warn "Empty window:              $n_empty\n";
+warn "Failed min channels:       $n_failed_min_channels\n";
+warn "Failed min intensity:      $n_failed_min_int\n";
+warn "Passing spectra:           $n_passed\n";
 warn "----------------------\n\n";
 
 exit;
@@ -517,20 +530,41 @@ sub process_psm {
 
         $px_parser->goto_list($run_idx);
         my $query = $px_parser->fetch_result($query_idx);
-        my $mzml_fn = $px_parser->raw_file($run_idx);
-        my $mx_parser = $mzml{$mzml_fn};
+
         my $scan_id = $query->{spectrumNativeID};
         my $scan_num = $query->{start_scan};
-        
         my $top = $query->get_hit(0);
 
+        #apply early filters
+        my $peptide = $top->{peptide};
+
+        #ignore spectra with no hits
+        if (! defined $peptide) {
+            lock $n_no_matches;
+            ++$n_no_matches;
+            next SPECTRUM;
+        }
+
         #filter by qval if given
-        my $qval = $top->{search_score}
-            // $qvals{$scan_num};
+        if (defined $q_cutoff) {
 
-        next SPECTRUM
-            if (defined $qval && $qval > $q_cutoff);
+            # undefined values are set to 1, as percolator does not output
+            # matches with PEP=1
+            my $qval = $qvals{$scan_num}
+                // $top->{search_score}->{percolator_qvalue}
+                // 1;
 
+            if ($qval > $q_cutoff) {
+                lock $n_failed_q_cutoff;
+                ++$n_failed_q_cutoff;
+                next SPECTRUM;
+            }
+
+        }
+
+        my $mzml_fn = $px_parser->raw_file($run_idx);
+        my $mx_parser = $mzml{$mzml_fn};
+        
         my $scan_idx = $mx_parser->spectrum_index_by_id($scan_id);
         my $ms2 = $mx_parser->fetch_spectrum($scan_idx);
 
@@ -542,8 +576,6 @@ sub process_psm {
         my $mz   = sprintf "%0.4f", $ms2->precursor()->{mono_mz};
 
         my @proteins;
-
-        my $peptide = $top->{peptide};
 
         my $full_peptide = $peptide;
         my $offset = 0;
@@ -784,16 +816,21 @@ sub load_queue  {
         $px_parser = MS::Reader::PepXML->new($pepxml);
     }
 
+    my $n = 0;
+
     RUN:
     for my $run_idx (0..$px_parser->n_lists()-1) {
         $px_parser->goto_list($run_idx);
         SPECTRUM:
         for (0..$px_parser->result_count()-1) {
             $hit_queue->enqueue( [$run_idx, $_] );
+            ++$n;
         }
     }
     warn "done loading\n";
     $hit_queue->enqueue(undef) for (1..$threads);
+
+    return $n;
 
 }
 
@@ -848,7 +885,7 @@ sub mad {
 
 sub parse_percolator {
 
-    my $qvals;
+    my %qvals;
 
     open my $in, '<', $fn_perc;
     my $h = <$in>;
@@ -856,44 +893,32 @@ sub parse_percolator {
     my @headers = split "\t", $h;
 
     # handle tabular output from percolator or crux-percolator
-    # check for percolator output first
-    my $col_idx;
-    my $parse_idx = 0;
-    if (defined first_index {$_ eq 'PSMId'} @headers) {
-        $col_idx = $_;
-        $parse_idx = 1;
-    }
-    elsif (defined first_index {$_ eq 'scan'} @headers) {
-        $col_idx = $_;
-    }
-    else {
-        die "Missing expected index column in percolator table";
-    }
-    my $col_qval;
-    if (defined first_index {$_ eq 'q-value'} @headers) {
-        $col_qval = $_;
-    }
-    else {
-        die "Missing expected q-value column in percolator table";
-    }
+    my $col_idx = (first_index {$_ eq 'PSMId'} @headers)
+        // (first_index {$_ eq 'scan'} @headers)
+        // die "Missing expected index column in percolator table";
+    my $col_qval = (first_index {$_ eq 'q-value'} @headers)
+        // die "Missing expected q-value column in percolator table";
     
     # parse lines
     while (my $line = <$in>) {
         chomp $line;
         my @fields = split "\t", $line;
         my $scan = $fields[ $col_idx ];
-        if ($parse_idx) {
-            if ($scan =~ /_(\d+)_\d+_\d+$/) {
-                $scan = $1;
-            }
-            else {
-                die "Unexpected PSMId strint format in percolator table";
-            }
+        # first check for percolator format
+        if ($scan =~ /_(\d+)_\d+_\d+$/) {
+            $scan = $1;
         }
-        $qvals->{$scan} = $fields[ $col_qval ];
+        # then check percolator-crux format
+        elsif ($scan =~ /^(\d+)$/) {
+            $scan = $1;
+        }
+        else {
+            die "Unexpected scan ID format ($scan) in percolator table";
+        }
+        $qvals{$scan} = $fields[ $col_qval ];
     }
 
-    return $qvals;
+    return %qvals;
 
 }
 
