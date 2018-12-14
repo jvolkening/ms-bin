@@ -46,31 +46,35 @@ my $zero_floor;
 my $filter_unlabeled;
 my $digits;
 my $subtract_baseline = 0;
+my $q_cutoff;
+my $fn_perc;
 
 my @orig_argv = @ARGV;
 
 GetOptions(
-    'tags=s'          => \$fn_tags,
-    'correct_coelute' => \$correct_coelute,
-    'max_coelute=f'   => \$max_coelute,
-    'reporter_tol=f'  => \$reporter_tol,
-    'pre_tol=f'       => \$pre_tol,
-    'pre_shift=f'     => \$pre_shift,
-    'fuzzy_edges'     => \$fuzzy_edges,
-    'scale_by_inj'    => \$scale_by_inj,
-    'output_obs'      => \$print_obs,
-    'sd_tol=f'        => \$sd_tol,
-    'recal_reporters' => \$recal_reporters,
-    'impurities=s'    => \$fn_impurities,
-    'min_intensity=f' => \$min_int,
-    'threads=i'       => \$threads,
-    'decoy_tag=s'     => \$decoy_tag,
-    'zero_floor'      => \$zero_floor,
-    'filter_unlabeled' => \$filter_unlabeled,
-    'digits=i'        => \$digits,
-    'plot_reporters=s' => \$plot_reporters,
-    'min_matched=i'   => \$min_matched,
+    'tags=s'            => \$fn_tags,
+    'correct_coelute'   => \$correct_coelute,
+    'max_coelute=f'     => \$max_coelute,
+    'reporter_tol=f'    => \$reporter_tol,
+    'pre_tol=f'         => \$pre_tol,
+    'pre_shift=f'       => \$pre_shift,
+    'fuzzy_edges'       => \$fuzzy_edges,
+    'scale_by_inj'      => \$scale_by_inj,
+    'output_obs'        => \$print_obs,
+    'sd_tol=f'          => \$sd_tol,
+    'recal_reporters'   => \$recal_reporters,
+    'impurities=s'      => \$fn_impurities,
+    'min_intensity=f'   => \$min_int,
+    'threads=i'         => \$threads,
+    'decoy_tag=s'       => \$decoy_tag,
+    'zero_floor'        => \$zero_floor,
+    'filter_unlabeled'  => \$filter_unlabeled,
+    'digits=i'          => \$digits,
+    'plot_reporters=s'  => \$plot_reporters,
+    'min_matched=i'     => \$min_matched,
     'subtract_baseline' => \$subtract_baseline,
+    'q-value'           => \$q_cutoff,
+    'percolator'        => \$fn_perc,
 ) or die "Error parsing options\n";
 
 
@@ -169,6 +173,10 @@ for (1..$threads) {
     push @workers, threads->create(\&process_psm);
 }
 
+# load separate percolator table if given
+my %qvals :shared = defined $fn_perc
+    ? parse_percolator()
+    : ();
 
 load_queue();
 
@@ -512,6 +520,17 @@ sub process_psm {
         my $mzml_fn = $px_parser->raw_file($run_idx);
         my $mx_parser = $mzml{$mzml_fn};
         my $scan_id = $query->{spectrumNativeID};
+        my $scan_num = $query->{start_scan};
+        
+        my $top = $query->get_hit(0);
+
+        #filter by qval if given
+        my $qval = $top->{search_score}
+            // $qvals{$scan_num};
+
+        next SPECTRUM
+            if (defined $qval && $qval > $q_cutoff);
+
         my $scan_idx = $mx_parser->spectrum_index_by_id($scan_id);
         my $ms2 = $mx_parser->fetch_spectrum($scan_idx);
 
@@ -523,7 +542,6 @@ sub process_psm {
         my $mz   = sprintf "%0.4f", $ms2->precursor()->{mono_mz};
 
         my @proteins;
-        my $top = $query->get_hit(0);
 
         my $peptide = $top->{peptide};
 
@@ -827,4 +845,55 @@ sub mad {
     return median( map {abs($_-$m)} @vals );
 
 }
+
+sub parse_percolator {
+
+    my $qvals;
+
+    open my $in, '<', $fn_perc;
+    my $h = <$in>;
+    chomp $h;
+    my @headers = split "\t", $h;
+
+    # handle tabular output from percolator or crux-percolator
+    # check for percolator output first
+    my $col_idx;
+    my $parse_idx = 0;
+    if (defined first_index {$_ eq 'PSMId'} @headers) {
+        $col_idx = $_;
+        $parse_idx = 1;
+    }
+    elsif (defined first_index {$_ eq 'scan'} @headers) {
+        $col_idx = $_;
+    }
+    else {
+        die "Missing expected index column in percolator table";
+    }
+    my $col_qval;
+    if (defined first_index {$_ eq 'q-value'} @headers) {
+        $col_qval = $_;
+    }
+    else {
+        die "Missing expected q-value column in percolator table";
+    }
     
+    # parse lines
+    while (my $line = <$in>) {
+        chomp $line;
+        my @fields = split "\t", $line;
+        my $scan = $fields[ $col_idx ];
+        if ($parse_idx) {
+            if ($scan =~ /_(\d+)_\d+_\d+$/) {
+                $scan = $1;
+            }
+            else {
+                die "Unexpected PSMId strint format in percolator table";
+            }
+        }
+        $qvals->{$scan} = $fields[ $col_qval ];
+    }
+
+    return $qvals;
+
+}
+
