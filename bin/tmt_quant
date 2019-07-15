@@ -39,7 +39,7 @@ my $scale_by_inj    = 0;
 my $print_obs       = 0;
 my $recal_reporters = 0;
 my $plot_reporters;
-my $sd_tol          = 3;
+my $sd_tol          = 6;
 my $min_int         = 0;
 my $min_matched     = 1;
 my $threads         = 1;
@@ -52,6 +52,7 @@ my $subtract_baseline = 0;
 my $q_cutoff;
 my $fn_perc;
 my $fn_perc_log;
+my $fn_stats;
 
 my @orig_argv = @ARGV;
 
@@ -80,12 +81,13 @@ GetOptions(
     'qvalue=f'          => \$q_cutoff,
     'percolator=s'      => \$fn_perc,
     'perc_log=s'        => \$fn_perc_log,
+    'stats=s'           => \$fn_stats,
 ) or die "Error parsing options\n";
 
 # load separate percolator table if given
-my %qvals = defined $fn_perc
+my ($qvals, $perc_probs) = defined $fn_perc
     ? parse_percolator()
-    : ();
+    : (undef, undef);
 # load separate percolator table if given
 my %perc_idx = defined $fn_perc_log
     ? parse_percolator_log()
@@ -288,8 +290,8 @@ for my $infile (@pepxml_files) {
                 my $mean = $stat->mean;
                 my $sd   = $stat->standard_deviation;
                 $tag->{$run}->{center} = sprintf "%0.7f", $mean;
-                $tag->{$run}->{lower}  = sprintf "%0.7f", $mean-$sd*6;
-                $tag->{$run}->{upper}  = sprintf "%0.7f", $mean+$sd*6;
+                $tag->{$run}->{lower}  = sprintf "%0.7f", $mean-$sd*$sd_tol;
+                $tag->{$run}->{upper}  = sprintf "%0.7f", $mean+$sd*$sd_tol;
             }
         }
 
@@ -338,7 +340,7 @@ for my $infile (@pepxml_files) {
         $R->run(qq`pdf("$pepxml.$plot_reporters", 11, 8.5, pointsize=11, useDingbats=F)`);
         $R->run(q`par(mfrow=c(4,5))`);
         $R->run(q`par(mgp=c(2.2,0.7,0))`);
-        $R->run(q`par(mar=c(4,4,3.5,3.5))`);
+        $R->run(q`par(mar=c(2.5,2.5,2.0,2.0))`);
         $R->run(q`par(omi=c(1,1,1,1))`);
 
         for my $tag (@reporters) {
@@ -367,7 +369,7 @@ for my $infile (@pepxml_files) {
                 
                 $R->set('mz', $series[$_]);
                 if ($_ == 0) {
-                    $R->run(qq`plot(density(mz),xlim=c(xlo,xhi),main="$name",xlab="m/z",ylab="density",lwd=0.5)`);
+                    $R->run(qq`plot(density(mz),xlim=c(xlo,xhi),main="$name",xlab="",ylab="",lwd=0.5)`);
                 }
                 else {
                     $R->run(qq`lines(density(mz),lwd=0.5)`);
@@ -408,7 +410,7 @@ for my $infile (@pepxml_files) {
             $R->run(q`xlo <- xmin - (xmax-xmin)*.15`);
             $R->run(q`xhi <- xmax + (xmax-xmin)*.15`);
             $R->run(q`xhi <- xmax + (xmax-xmin)*.15`);
-            $R->run(qq`smoothScatter(mz,log10(int),xlim=c(xlo,xhi),main="$name",xlab="m/z",ylab="log10 intensity")`);
+            $R->run(qq`smoothScatter(mz,log10(int),xlim=c(xlo,xhi),main="$name",xlab="",ylab="")`);
 
             for (0..$#lowers) {
 
@@ -420,6 +422,9 @@ for my $infile (@pepxml_files) {
             }
 
         }
+        $R->run(q`mtext("m/z", side=1, outer=T, at=0.5)`);
+        $R->run(q`mtext("density", side=2, outer=T, at=0.25)`);
+        $R->run(q`mtext("log10 intensity", side=2, outer=T, at=0.75)`);
         $R->run(q`dev.off()`);
 
     }    
@@ -445,8 +450,8 @@ for my $infile (@pepxml_files) {
 
         my @parts = @{$spectrum};
 
-        my ($run, $name,$prob,$peptide,$mz,$charge,$full_peptide,$protein,$inf,$baseline,$is_ntagged,$tagged_lys)
-            = splice @parts, 0, 12;
+        my ($run, $name,$prob,$qval,$peptide,$mz,$charge,$full_peptide,$protein,$inf,$baseline,$is_ntagged,$tagged_lys)
+            = splice @parts, 0, 13;
         if (! scalar(@parts)) {
             ++$n_empty;
             #warn "empty reporter window\n";
@@ -498,7 +503,7 @@ for my $infile (@pepxml_files) {
             @interferences = map {$_ * $sum_interference} @scale_factors;
         }
 
-        my $print_string = "$name\t$prob\t$peptide\t$mz\t$charge\t$full_peptide\t$protein\t$inf\t$is_ntagged\t$tagged_lys";
+        my $print_string = "$name\t$prob\t$qval\t$peptide\t$mz\t$charge\t$full_peptide\t$protein\t$inf\t$is_ntagged\t$tagged_lys";
         for (0..$#reporters) {
             my $int  = $values[$_] - $interferences[$_];
             $int = 0 if ($int < 0 && $zero_floor);
@@ -529,10 +534,25 @@ warn "Failed min intensity:      $n_failed_min_int\n";
 warn "Passing spectra:           $n_passed\n";
 warn "----------------------\n\n";
 
+if (defined $fn_stats) {
+    open my $fh_stats, '>', $fn_stats;
+    say {$fh_stats} join "\t", 'total',                $n_spectra;
+    say {$fh_stats} join "\t", 'no_matches',           $n_no_matches;
+    say {$fh_stats} join "\t", 'failed_fdr',           $n_failed_q_cutoff;
+    say {$fh_stats} join "\t", 'failed_multihit',      $n_multiple_hits;
+    say {$fh_stats} join "\t", 'failed_coisolation',   $n_failed_coelute;
+    say {$fh_stats} join "\t", 'empty_windows',        $n_empty;
+    say {$fh_stats} join "\t", 'failed_min_channels',  $n_failed_min_channels;
+    say {$fh_stats} join "\t", 'failed_min_intensity', $n_failed_min_int;
+    say {$fh_stats} join "\t", 'passed',               $n_passed;
+    close $fh_stats;
+}
+
 print $header;
 say join "\t", qw/
     id
     probability
+    q-value
     peptide
     mz
     charge
@@ -614,13 +634,15 @@ sub process_psm {
             next SPECTRUM;
         }
 
+        my $qval = '';
+
         #filter by qval if given
         if (defined $q_cutoff) {
 
             # undefined values are set to 1, as percolator does not output
             # decoys or matches with PEP=1
             
-            my $qval = $qvals{$scan_num}
+            $qval = $qvals->{$scan_num}
                 // $top->{search_score}->{percolator_qvalue}
                 // 1;
 
@@ -711,8 +733,12 @@ sub process_psm {
             my $name = $_->{analysis};
             $scores{$name} = $_->{"${name}_result"}->{probability};
         }
-        my $prob = first {defined $_} ($scores{interprophet},
-            $scores{peptideprophet}, '');
+        my $prob = first {defined $_} (
+            $scores{interprophet},
+            $scores{peptideprophet},
+            $perc_probs->{$scan_num},
+            '',
+        );
             
         my $inj_time = $scale_by_inj
             ? $ms2->{scanList}->{scan}->[0]->{cvParam}->{&MS_ION_INJECTION_TIME}->[0]->{value}
@@ -865,6 +891,7 @@ sub process_psm {
                 $run_idx,
                 $name,
                 $prob,
+                $qval,
                 $peptide,
                 $mz,
                 $z,
@@ -963,6 +990,7 @@ sub mad {
 sub parse_percolator {
 
     my %qvals;
+    my %perc_probs;
 
     open my $in, '<', $fn_perc;
     my $h = <$in>;
@@ -979,6 +1007,8 @@ sub parse_percolator {
         if ($col_qval < 0);
     my $col_file = (first_index {$_ eq 'file_idx'} @headers);
     $col_file = undef if ($col_file < 0);
+    my $col_pep = (first_index {$_ eq 'posterior_error_prob' || $_ eq 'percolator PEP'} @headers);
+    $col_pep = undef if ($col_pep < 0);
 
     # if file index is present, we need the crux percolator log to decode
     if (defined $col_file && ! defined $fn_perc_log) {
@@ -1014,8 +1044,11 @@ sub parse_percolator {
         # a backup will fail a threshold comparison
         my $q = defined $qvals{$scan} ? DUP_Q : $fields[ $col_qval ];
         $qvals{$scan} = $q;
+        $perc_probs{$scan} = defined $col_pep
+            ? 1 - $fields[$col_pep]
+            : undef;
     }
-    return %qvals;
+    return (\%qvals, \%perc_probs);
 
 }
 
