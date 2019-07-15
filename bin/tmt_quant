@@ -24,8 +24,9 @@ use Statistics::R;
 use Statistics::Descriptive;
 
 use constant PROTON => elem_mass('H');
+use constant DUP_Q  => 2;
 
-our $VERSION = 0.010;
+our $VERSION = 0.011;
 
 my $fn_tags;
 my $correct_coelute = 0;
@@ -50,6 +51,7 @@ my $digits;
 my $subtract_baseline = 0;
 my $q_cutoff;
 my $fn_perc;
+my $fn_perc_log;
 
 my @orig_argv = @ARGV;
 
@@ -75,94 +77,29 @@ GetOptions(
     'plot_reporters=s'  => \$plot_reporters,
     'min_matched=i'     => \$min_matched,
     'subtract_baseline' => \$subtract_baseline,
-    'q-value=f'         => \$q_cutoff,
+    'qvalue=f'          => \$q_cutoff,
     'percolator=s'      => \$fn_perc,
+    'perc_log=s'        => \$fn_perc_log,
 ) or die "Error parsing options\n";
-
-
-my $pepxml :shared = $ARGV[-1];
-my $px_parser = MS::Reader::PepXML->new($pepxml);
-my $n_runs = $px_parser->n_lists();
-
-die "Tag configuration file required" if (! defined $fn_tags);
-
-# read in tag masses
-my @reporters;
-open my $tags, '<', $fn_tags or die "Error opening tags file: $!\n";
-while (my $line = <$tags>) {
-    chomp $line;
-    my ($name, $mz) = split "\t", $line;
-    die "Invalid tag file\n" if (! defined $mz);
-    die "Invalid tag file\n" if ($mz !~ /^[\d\.]+$/);
-    my $ref = { name => $name };
-    for (0..$n_runs-1) {
-        $ref->{$_}->{center} = $mz;
-    }
-    push @reporters, $ref;
-}
-close $tags;
-
-my $REP_LOWER = min( map {$_->{0}->{center}} @reporters) - 1;
-my $REP_UPPER = max( map {$_->{0}->{center}} @reporters) + 1;
-
-for my $i (0..$#reporters) {
-    my $tol = $recal_reporters ? $reporter_tol*3 : $reporter_tol;
-    my $lower = $reporters[$i]->{0}->{center}*(1-$tol/1000000);
-    my $upper = $reporters[$i]->{0}->{center}*(1+$tol/1000000);
-  
-    # make sure windows don't overlap
-    if ($i > 0) {
-        my $mid = (
-            $reporters[$i-1]->{0}->{center}
-          + $reporters[$i  ]->{0}->{center} ) / 2;
-        $lower = $mid if ($lower < $mid);
-    }
-    if ($i < $#reporters) {
-        my $mid = (
-            $reporters[$i  ]->{0}->{center}
-          + $reporters[$i+1]->{0}->{center} ) / 2;
-        $upper = $mid if ($upper > $mid);
-    }
-
-    for (0..$n_runs-1) {
-        $reporters[$i]->{$_}->{lower} = sprintf "%0.7f", $lower;
-        $reporters[$i]->{$_}->{upper} = sprintf "%0.7f", $upper;
-    }
-}
-
-
-warn "Windows for first scan:\n";
-for my $rep (@reporters) {
-    for my $run (0..$n_runs-1) {
-        warn join( "\t",
-            $rep->{name},
-            "run $run",
-            $rep->{$run}->{center},
-            $rep->{$run}->{lower},
-            $rep->{$run}->{upper},
-        ) . "\n";
-    }
-}
-
-# import isotope impurity matrix, if provided
-my $impurities;
-if (defined $fn_impurities) {
-    open my $in, '<', $fn_impurities;
-    my $h = <$in>;
-    my @m;
-    while (my $line = <$in>) {
-        chomp $line;
-        my @parts = split "\t", $line;
-        shift @parts;
-        push @m, [@parts];
-    }
-    $impurities = Math::Matrix->new( @m )->transpose;
-}
 
 # load separate percolator table if given
 my %qvals = defined $fn_perc
     ? parse_percolator()
     : ();
+# load separate percolator table if given
+my %perc_idx = defined $fn_perc_log
+    ? parse_percolator_log()
+    : ();
+
+# if multi-file crux percolator given, we need to iterate over all separate pepXML
+# files. Otherwise, just parse the last command line argument
+my @pepxml_files;
+if (scalar keys %perc_idx) {
+    @pepxml_files = keys %perc_idx;
+}
+else {
+    @pepxml_files = ($ARGV[-1]);
+}
 
 # track PSM status
 my $n_spectra                 = 0;
@@ -173,226 +110,427 @@ my $n_failed_min_int          = 0;
 my $n_failed_coelute          = 0;
 my $n_no_matches :shared      = 0;
 my $n_failed_q_cutoff :shared = 0;
+my $n_multiple_hits :shared   = 0;
 
-# track reporter mass error for summary purposes
-my @obs_mz  = map { {map {$_->{name} => []} @reporters} } 0..($n_runs-1);
-my @obs_int = map { {map {$_->{name} => []} @reporters} } 0..($n_runs-1);
-my $obs_mz  = shared_clone(\@obs_mz);
-my $obs_int = shared_clone(\@obs_int);
+my $pepxml :shared;
+my $file_idx :shared;
+my @reporter_names;
 
-my @channel_sums :shared = map {0} (0..$#reporters);
+# these scalars will contain the actual output. Because of the way crux
+# percolator files are parsed, it must be cached and printed at the end
+my $header = '';
+my $body = '';
 
-my @spectra :shared = ();
+$header .= "## Produced by tmt_quant v$VERSION\n";
+$header .= "## Command-line arguments: @orig_argv\n";
+$header .= "## Final reporter windows:\n";
 
-my $hit_queue = Thread::Queue->new();
-my @workers;
-for (1..$threads) {
-    push @workers, threads->create(\&process_psm);
-}
+for my $infile (@pepxml_files) {
 
+    $pepxml = $infile;
+    $file_idx = $perc_idx{ $infile }; # can be undef
 
-$n_spectra = load_queue();
+    say STDERR "Processing $infile\n---------------------";
 
-# wait for all threads to finish
-for (@workers) {
-    $_->join();
-}
+    my $px_parser = MS::Reader::PepXML->new($pepxml);
+    my $n_runs = $px_parser->n_lists();
 
-# correct channel sums for impurities
-if (defined $impurities) {
-    my $uncorrected = Math::Matrix->new([@channel_sums]);
-    my $a = $impurities->concat( $uncorrected->transpose );
-    @channel_sums = @{ $a->solve()->transpose->[0] };
-}
+    die "Tag configuration file required" if (! defined $fn_tags);
 
-if ($print_obs) {
-    for my $run (0..$n_runs-1) {
-        for my $tag (keys %{$obs_mz->[$run]}) {
-            my @observed_mz  = @{  $obs_mz->[$run]->{$tag} };
-            my @observed_int = @{ $obs_int->[$run]->{$tag} };
-            my $m = median(@observed_mz);
-            my $s = mad(@observed_mz);
-            my $n = scalar(@observed_mz);
-            for (0..$#observed_mz) {
-                my $mz  = $observed_mz[$_];
-                my $int = $observed_int[$_];
-                my $diff = $mz - $m;
-                print "$run\t$tag\t$mz\t$diff\t$int\n";
-            }
-            warn "$run\t$tag\t$n\t$m\t$s\n";
+    # read in tag masses
+    my @reporters;
+    open my $tags, '<', $fn_tags or die "Error opening tags file: $!\n";
+    while (my $line = <$tags>) {
+        chomp $line;
+        my ($name, $mz) = split "\t", $line;
+        die "Invalid tag file\n" if (! defined $mz);
+        die "Invalid tag file\n" if ($mz !~ /^[\d\.]+$/);
+        my $ref = { name => $name };
+        for (0..$n_runs-1) {
+            $ref->{$_}->{center} = $mz;
         }
+        push @reporters, $ref;
     }
-    exit;
-}
-
-if ($recal_reporters) {
-    warn "----------------------\n";
-    warn "recalibrated channels:\n";
-    for my $tag (@reporters) {
-
-        my $name = $tag->{name};
-
-        for my $run (0..$n_runs-1) {
-            my @observed = @{ $obs_mz->[$run]->{$name} };
-            my $stat = Statistics::Descriptive::Sparse->new();
-            $stat->add_data(@observed);
-            my $mean = $stat->mean;
-            my $sd   = $stat->standard_deviation;
-            $tag->{$run}->{center} = sprintf "%0.7f", $mean;
-            $tag->{$run}->{lower}  = sprintf "%0.7f", $mean-$sd*6;
-            $tag->{$run}->{upper}  = sprintf "%0.7f", $mean+$sd*6;
-        }
+    close $tags;
+    if (! scalar @reporter_names) {
+        @reporter_names = map {$_->{name}} @reporters;
     }
 
-    # make sure windows don't overlap (may happen for very wide tolerances)
+    my $REP_LOWER = min( map {$_->{0}->{center}} @reporters) - 1;
+    my $REP_UPPER = max( map {$_->{0}->{center}} @reporters) + 1;
+
     for my $i (0..$#reporters) {
+        my $tol = $recal_reporters ? $reporter_tol*3 : $reporter_tol;
+        my $lower = $reporters[$i]->{0}->{center}*(1-$tol/1000000);
+        my $upper = $reporters[$i]->{0}->{center}*(1+$tol/1000000);
+    
+        # make sure windows don't overlap
+        if ($i > 0) {
+            my $mid = (
+                $reporters[$i-1]->{0}->{center}
+            + $reporters[$i  ]->{0}->{center} ) / 2;
+            $lower = $mid if ($lower < $mid);
+        }
+        if ($i < $#reporters) {
+            my $mid = (
+                $reporters[$i  ]->{0}->{center}
+            + $reporters[$i+1]->{0}->{center} ) / 2;
+            $upper = $mid if ($upper > $mid);
+        }
 
-        my $name = $reporters[$i]->{name};
+        for (0..$n_runs-1) {
+            $reporters[$i]->{$_}->{lower} = sprintf "%0.7f", $lower;
+            $reporters[$i]->{$_}->{upper} = sprintf "%0.7f", $upper;
+        }
+    }
 
+
+    warn "Windows for first scan:\n";
+    for my $rep (@reporters) {
         for my $run (0..$n_runs-1) {
-
-            my $lower = $reporters[$i]->{$run}->{lower};
-            my $upper = $reporters[$i]->{$run}->{upper};
-            
-            if ($i > 0) {
-                my $mid = (
-                    $reporters[$i-1]->{$run}->{center}
-                  + $reporters[$i  ]->{$run}->{center} ) / 2;
-                $lower = $mid if ($lower < $mid);
-            }
-            if ($i < $#reporters) {
-                my $mid = (
-                    $reporters[$i  ]->{$run}->{center}
-                  + $reporters[$i+1]->{$run}->{center} ) / 2;
-                $upper = $mid if ($upper > $mid);
-            }
-
-            $reporters[$i]->{$run}->{lower} = sprintf "%0.7f", $lower;
-            $reporters[$i]->{$run}->{upper} = sprintf "%0.7f", $upper;
-            warn join("\t",
-                $name,
+            warn join( "\t",
+                $rep->{name},
                 "run $run",
-                $reporters[$i]->{$run}->{center},
-                $reporters[$i]->{$run}->{lower},
-                $reporters[$i]->{$run}->{upper},
+                $rep->{$run}->{center},
+                $rep->{$run}->{lower},
+                $rep->{$run}->{upper},
             ) . "\n";
         }
     }
-    warn "----------------------\n";
-}
 
-if (defined $plot_reporters) {
+    # import isotope impurity matrix, if provided
+    my $impurities;
+    if (defined $fn_impurities) {
+        open my $in, '<', $fn_impurities;
+        my $h = <$in>;
+        my @m;
+        while (my $line = <$in>) {
+            chomp $line;
+            my @parts = split "\t", $line;
+            shift @parts;
+            push @m, [@parts];
+        }
+        $impurities = Math::Matrix->new( @m )->transpose;
+    }
 
-    my $R = Statistics::R->new();
+    # track reporter mass error for summary purposes
+    my @obs_mz  = map { {map {$_->{name} => []} @reporters} } 0..($n_runs-1);
+    my @obs_int = map { {map {$_->{name} => []} @reporters} } 0..($n_runs-1);
+    my $obs_mz  = shared_clone(\@obs_mz);
+    my $obs_int = shared_clone(\@obs_int);
 
-    # initialize PDF
-    $R->run(qq`pdf("$plot_reporters", 11, 8.5, pointsize=11, useDingbats=F)`);
-    $R->run(q`par(mfrow=c(4,5))`);
-    $R->run(q`par(mgp=c(2.2,0.7,0))`);
-    $R->run(q`par(mar=c(4,4,3.5,3.5))`);
-    $R->run(q`par(omi=c(1,1,1,1))`);
+    my @channel_sums :shared = map {0} (0..$#reporters);
+
+    my @spectra :shared = ();
+
+    my $hit_queue = Thread::Queue->new();
+    my @workers;
+    for (1..$threads) {
+        push @workers, threads->create(
+            \&process_psm,
+            $hit_queue,
+            $REP_LOWER,
+            $REP_UPPER,
+            \@reporters,
+            $obs_mz,
+            $obs_int,
+            \@channel_sums,
+            \@spectra,
+        );
+    }
+
+
+    $n_spectra += load_queue($hit_queue);
+
+    # wait for all threads to finish
+    for (@workers) {
+        $_->join();
+    }
+
+    # correct channel sums for impurities
+    if (defined $impurities) {
+        my $uncorrected = Math::Matrix->new([@channel_sums]);
+        my $a = $impurities->concat( $uncorrected->transpose );
+        @channel_sums = @{ $a->solve()->transpose->[0] };
+    }
+
+    if ($print_obs) {
+        for my $run (0..$n_runs-1) {
+            for my $tag (keys %{$obs_mz->[$run]}) {
+                my @observed_mz  = @{  $obs_mz->[$run]->{$tag} };
+                my @observed_int = @{ $obs_int->[$run]->{$tag} };
+                my $m = median(@observed_mz);
+                my $s = mad(@observed_mz);
+                my $n = scalar(@observed_mz);
+                for (0..$#observed_mz) {
+                    my $mz  = $observed_mz[$_];
+                    my $int = $observed_int[$_];
+                    my $diff = $mz - $m;
+                    print "$run\t$tag\t$mz\t$diff\t$int\n";
+                }
+                warn "$run\t$tag\t$n\t$m\t$s\n";
+            }
+        }
+        exit;
+    }
+
+    if ($recal_reporters) {
+        warn "----------------------\n";
+        warn "recalibrated channels:\n";
+        for my $tag (@reporters) {
+
+            my $name = $tag->{name};
+
+            for my $run (0..$n_runs-1) {
+                my @observed = @{ $obs_mz->[$run]->{$name} };
+                my $stat = Statistics::Descriptive::Sparse->new();
+                $stat->add_data(@observed);
+                my $mean = $stat->mean;
+                my $sd   = $stat->standard_deviation;
+                $tag->{$run}->{center} = sprintf "%0.7f", $mean;
+                $tag->{$run}->{lower}  = sprintf "%0.7f", $mean-$sd*6;
+                $tag->{$run}->{upper}  = sprintf "%0.7f", $mean+$sd*6;
+            }
+        }
+
+        # make sure windows don't overlap (may happen for very wide tolerances)
+        for my $i (0..$#reporters) {
+
+            my $name = $reporters[$i]->{name};
+
+            for my $run (0..$n_runs-1) {
+
+                my $lower = $reporters[$i]->{$run}->{lower};
+                my $upper = $reporters[$i]->{$run}->{upper};
+                
+                if ($i > 0) {
+                    my $mid = (
+                        $reporters[$i-1]->{$run}->{center}
+                    + $reporters[$i  ]->{$run}->{center} ) / 2;
+                    $lower = $mid if ($lower < $mid);
+                }
+                if ($i < $#reporters) {
+                    my $mid = (
+                        $reporters[$i  ]->{$run}->{center}
+                    + $reporters[$i+1]->{$run}->{center} ) / 2;
+                    $upper = $mid if ($upper > $mid);
+                }
+
+                $reporters[$i]->{$run}->{lower} = sprintf "%0.7f", $lower;
+                $reporters[$i]->{$run}->{upper} = sprintf "%0.7f", $upper;
+                warn join("\t",
+                    $name,
+                    "run $run",
+                    $reporters[$i]->{$run}->{center},
+                    $reporters[$i]->{$run}->{lower},
+                    $reporters[$i]->{$run}->{upper},
+                ) . "\n";
+            }
+        }
+        warn "----------------------\n";
+    }
+
+    if (defined $plot_reporters) {
+
+        my $R = Statistics::R->new();
+
+        # initialize PDF
+        $R->run(qq`pdf("$pepxml.$plot_reporters", 11, 8.5, pointsize=11, useDingbats=F)`);
+        $R->run(q`par(mfrow=c(4,5))`);
+        $R->run(q`par(mgp=c(2.2,0.7,0))`);
+        $R->run(q`par(mar=c(4,4,3.5,3.5))`);
+        $R->run(q`par(omi=c(1,1,1,1))`);
+
+        for my $tag (@reporters) {
+
+            my @lowers;
+            my @uppers;
+            my @series;
+            my $name = $tag->{name};
+
+            for my $run (0..$n_runs-1) {
+                push @lowers, $tag->{$run}->{lower};
+                push @uppers, $tag->{$run}->{upper};
+                push @series, $obs_mz->[$run]->{$name};
+            }
+            my $x_min = min( @lowers, map {@$_} @series );
+            my $x_max = max( @uppers, map {@$_} @series );
+                
+
+            $R->set('xmin', $x_min);
+            $R->set('xmax', $x_max);
+            $R->run(q`xlo <- xmin - (xmax-xmin)*.15`);
+            $R->run(q`xhi <- xmax + (xmax-xmin)*.15`);
+            $R->run(q`xhi <- xmax + (xmax-xmin)*.15`);
+
+            for (0..$#series) {
+                
+                $R->set('mz', $series[$_]);
+                if ($_ == 0) {
+                    $R->run(qq`plot(density(mz),xlim=c(xlo,xhi),main="$name",xlab="m/z",ylab="density",lwd=0.5)`);
+                }
+                else {
+                    $R->run(qq`lines(density(mz),lwd=0.5)`);
+                }
+            }
+
+            for (0..$#series) {
+
+                $R->set('lower', $lowers[$_]);
+                $R->set('upper', $uppers[$_]);
+                $R->run(q`abline(v=lower,col="red",lwd=0.5)`);
+                $R->run(q`abline(v=upper,col="red",lwd=0.5)`);
+
+            }
+        }
+        for my $tag (@reporters) {
+
+            my @lowers;
+            my @uppers;
+            my @mz;
+            my @int;
+            my $name = $tag->{name};
+
+            for my $run (0..$n_runs-1) {
+                push @lowers, $tag->{$run}->{lower};
+                push @uppers, $tag->{$run}->{upper};
+                push @mz, @{ $obs_mz->[$run]->{$name} };
+                push @int, @{ $obs_int->[$run]->{$name} };
+            }
+            my $x_min = min( @lowers, @mz );
+            my $x_max = max( @uppers, @mz );
+                
+
+            $R->set('mz',  \@mz);
+            $R->set('int', \@int);
+            $R->set('xmin', $x_min);
+            $R->set('xmax', $x_max);
+            $R->run(q`xlo <- xmin - (xmax-xmin)*.15`);
+            $R->run(q`xhi <- xmax + (xmax-xmin)*.15`);
+            $R->run(q`xhi <- xmax + (xmax-xmin)*.15`);
+            $R->run(qq`smoothScatter(mz,log10(int),xlim=c(xlo,xhi),main="$name",xlab="m/z",ylab="log10 intensity")`);
+
+            for (0..$#lowers) {
+
+                $R->set('lower', $lowers[$_]);
+                $R->set('upper', $uppers[$_]);
+                $R->run(q`abline(v=lower,col="red",lwd=0.5)`);
+                $R->run(q`abline(v=upper,col="red",lwd=0.5)`);
+
+            }
+
+        }
+        $R->run(q`dev.off()`);
+
+    }    
+
+    my $total_int = sum @channel_sums;
+    my @scale_factors = map {$_/$total_int} @channel_sums;
 
     for my $tag (@reporters) {
-
-        my @lowers;
-        my @uppers;
-        my @series;
-        my $name = $tag->{name};
-
         for my $run (0..$n_runs-1) {
-            push @lowers, $tag->{$run}->{lower};
-            push @uppers, $tag->{$run}->{upper};
-            push @series, $obs_mz->[$run]->{$name};
+            $header .= "##   " . join( "\t",
+                $pepxml,
+                $tag->{name},
+                "run $run",
+                $tag->{$run}->{lower},
+                $tag->{$run}->{upper},
+            ) . "\n";
         }
-        my $x_min = min( @lowers, map {@$_} @series );
-        my $x_max = max( @uppers, map {@$_} @series );
-            
+    }
 
-        $R->set('xmin', $x_min);
-        $R->set('xmax', $x_max);
-        $R->run(q`xlo <- xmin - (xmax-xmin)*.15`);
-        $R->run(q`xhi <- xmax + (xmax-xmin)*.15`);
-        $R->run(q`xhi <- xmax + (xmax-xmin)*.15`);
 
-        for (0..$#series) {
-            
-            $R->set('mz', $series[$_]);
-            if ($_ == 0) {
-                $R->run(qq`plot(density(mz),xlim=c(xlo,xhi),main="$name",xlab="m/z",ylab="density",lwd=0.5)`);
+    SPECTRUM:
+    for my $spectrum (@spectra) {
+
+        my @parts = @{$spectrum};
+
+        my ($run, $name,$prob,$peptide,$mz,$charge,$full_peptide,$protein,$inf,$baseline,$is_ntagged,$tagged_lys)
+            = splice @parts, 0, 12;
+        if (! scalar(@parts)) {
+            ++$n_empty;
+            #warn "empty reporter window\n";
+            next SPECTRUM;
+        }
+        die "reporter values not multiple of 2!\n" if (scalar(@parts) % 2);
+        my $mid = scalar(@parts)/2;
+        my @mz_reporter_win  = @parts[0..$mid-1];
+        my @int_reporter_win = @parts[$mid..$#parts];
+        my ($rep_mz,$rep_int) = extract_channels($run, \@mz_reporter_win, \@int_reporter_win, \@reporters);
+
+        # filter by minimum number of matched channels
+        if (keys %$rep_int < $min_matched) {
+            #warn "Too few channels matched\n";
+            ++$n_failed_min_channels;
+            next SPECTRUM;
+        }
+
+        my @values = map {defined $rep_int->{$_->{name}} ? $rep_int->{$_->{name}} : $baseline} @reporters;
+        if (any {$_ < $baseline} @values) {
+            warn "@values less than $baseline!!!!\n";
+            exit;
+        }
+        @values = map {$_ - $baseline} @values
+            if ($subtract_baseline);
+        
+        if (max(@values) < $min_int) {
+            #warn "below min int\n";
+            ++$n_failed_min_int;
+            next SPECTRUM;
+        }
+
+        if ($max_coelute && $inf > $max_coelute) {
+            ++$n_failed_coelute;
+            next SPECTRUM;
+        }
+
+        # correct channel sums for impurities
+        if (defined $impurities) {
+            my $uncorrected = Math::Matrix->new([@values]);
+            my $a = $impurities->concat( $uncorrected->transpose );
+            @values = @{ $a->solve()->transpose->[0] };
+        }
+
+        # correct for coeluting precursors
+        my @interferences = map {0} @scale_factors;
+        if ($correct_coelute) {
+            my $sum_interference = sum(@values) * $inf;
+            @interferences = map {$_ * $sum_interference} @scale_factors;
+        }
+
+        my $print_string = "$name\t$prob\t$peptide\t$mz\t$charge\t$full_peptide\t$protein\t$inf\t$is_ntagged\t$tagged_lys";
+        for (0..$#reporters) {
+            my $int  = $values[$_] - $interferences[$_];
+            $int = 0 if ($int < 0 && $zero_floor);
+            if (defined $digits) {
+                $int = sprintf "%.${digits}f", $int;
             }
-            else {
-                $R->run(qq`lines(density(mz),lwd=0.5)`);
-            }
+            $print_string .= "\t$int";
         }
+        $print_string .= "\n";
+        $body .= $print_string;
 
-        for (0..$#series) {
-
-            $R->set('lower', $lowers[$_]);
-            $R->set('upper', $uppers[$_]);
-            $R->run(q`abline(v=lower,col="red",lwd=0.5)`);
-            $R->run(q`abline(v=upper,col="red",lwd=0.5)`);
-
-        }
-    }
-    for my $tag (@reporters) {
-
-        my @lowers;
-        my @uppers;
-        my @mz;
-        my @int;
-        my $name = $tag->{name};
-
-        for my $run (0..$n_runs-1) {
-            push @lowers, $tag->{$run}->{lower};
-            push @uppers, $tag->{$run}->{upper};
-            push @mz, @{ $obs_mz->[$run]->{$name} };
-            push @int, @{ $obs_int->[$run]->{$name} };
-        }
-        my $x_min = min( @lowers, @mz );
-        my $x_max = max( @uppers, @mz );
-            
-
-        $R->set('mz',  \@mz);
-        $R->set('int', \@int);
-        $R->set('xmin', $x_min);
-        $R->set('xmax', $x_max);
-        $R->run(q`xlo <- xmin - (xmax-xmin)*.15`);
-        $R->run(q`xhi <- xmax + (xmax-xmin)*.15`);
-        $R->run(q`xhi <- xmax + (xmax-xmin)*.15`);
-        $R->run(qq`smoothScatter(mz,log10(int),xlim=c(xlo,xhi),main="$name",xlab="m/z",ylab="log10 intensity")`);
-
-        for (0..$#lowers) {
-
-            $R->set('lower', $lowers[$_]);
-            $R->set('upper', $uppers[$_]);
-            $R->run(q`abline(v=lower,col="red",lwd=0.5)`);
-            $R->run(q`abline(v=upper,col="red",lwd=0.5)`);
-
-        }
+        ++$n_passed;
 
     }
-    $R->run(q`dev.off()`);
 
-}    
-
-my $total_int = sum @channel_sums;
-my @scale_factors = map {$_/$total_int} @channel_sums;
-
-print "## Produced by tmt_quant v$VERSION\n";
-print "## Command-line arguments: @orig_argv\n";
-print "## Final reporter windows:\n";
-for my $tag (@reporters) {
-    for my $run (0..$n_runs-1) {
-        say "##   ", join "\t",
-            $tag->{name},
-            "run $run",
-            $tag->{$run}->{lower},
-            $tag->{$run}->{upper},
-        ;
-    }
 }
 
-print join "\t", qw/
+warn "Summary:\n";
+warn "----------------------\n";
+warn "Total spectra:             $n_spectra\n";
+warn "No matches:                $n_no_matches\n";
+warn "Failed FDR cutoff:         $n_failed_q_cutoff\n";
+warn "Failed multihit check:     $n_multiple_hits\n";
+warn "Failed coisolation cutoff: $n_failed_coelute\n";
+warn "Empty window:              $n_empty\n";
+warn "Failed min channels:       $n_failed_min_channels\n";
+warn "Failed min intensity:      $n_failed_min_int\n";
+warn "Passing spectra:           $n_passed\n";
+warn "----------------------\n\n";
+
+print $header;
+say join "\t", qw/
     id
     probability
     peptide
@@ -403,94 +541,10 @@ print join "\t", qw/
     coelute_inf
     is_ntagged
     tagged_Lys
-    /;
-say "\t", join( "\t", map {$_->{name}} @reporters );
-
-SPECTRUM:
-for my $spectrum (@spectra) {
-
-    my @parts = @{$spectrum};
-
-    my ($run, $name,$prob,$peptide,$mz,$charge,$full_peptide,$protein,$inf,$baseline,$is_ntagged,$tagged_lys)
-        = splice @parts, 0, 12;
-    if (! scalar(@parts)) {
-        ++$n_empty;
-        #warn "empty reporter window\n";
-        next SPECTRUM;
-    }
-    die "reporter values not multiple of 2!\n" if (scalar(@parts) % 2);
-    my $mid = scalar(@parts)/2;
-    my @mz_reporter_win  = @parts[0..$mid-1];
-    my @int_reporter_win = @parts[$mid..$#parts];
-    my ($rep_mz,$rep_int) = extract_channels($run, \@mz_reporter_win, \@int_reporter_win);
-
-    # filter by minimum number of matched channels
-    if (keys %$rep_int < $min_matched) {
-        #warn "Too few channels matched\n";
-        ++$n_failed_min_channels;
-        next SPECTRUM;
-    }
-
-    my @values = map {defined $rep_int->{$_->{name}} ? $rep_int->{$_->{name}} : $baseline} @reporters;
-    if (any {$_ < $baseline} @values) {
-        warn "@values less than $baseline!!!!\n";
-        exit;
-    }
-    @values = map {$_ - $baseline} @values
-        if ($subtract_baseline);
-    
-    if (max(@values) < $min_int) {
-        #warn "below min int\n";
-        ++$n_failed_min_int;
-        next SPECTRUM;
-    }
-
-    if ($max_coelute && $inf > $max_coelute) {
-        ++$n_failed_coelute;
-        next SPECTRUM;
-    }
-
-    # correct channel sums for impurities
-    if (defined $impurities) {
-        my $uncorrected = Math::Matrix->new([@values]);
-        my $a = $impurities->concat( $uncorrected->transpose );
-        @values = @{ $a->solve()->transpose->[0] };
-    }
-
-    # correct for coeluting precursors
-    my @interferences = map {0} @scale_factors;
-    if ($correct_coelute) {
-        my $sum_interference = sum(@values) * $inf;
-        @interferences = map {$_ * $sum_interference} @scale_factors;
-    }
-
-    my $print_string = "$name\t$prob\t$peptide\t$mz\t$charge\t$full_peptide\t$protein\t$inf\t$is_ntagged\t$tagged_lys";
-    for (0..$#reporters) {
-        my $int  = $values[$_] - $interferences[$_];
-        $int = 0 if ($int < 0 && $zero_floor);
-        if (defined $digits) {
-            $int = sprintf "%.${digits}f", $int;
-        }
-        $print_string .= "\t$int";
-    }
-    $print_string .= "\n";
-    print $print_string;
-
-    ++$n_passed;
-
-}
-
-warn "Summary:\n";
-warn "----------------------\n";
-warn "Total spectra:             $n_spectra\n";
-warn "No matches:                $n_no_matches\n";
-warn "Failed FDR cutoff:         $n_failed_q_cutoff\n";
-warn "Failed coisolation cutoff: $n_failed_coelute\n";
-warn "Empty window:              $n_empty\n";
-warn "Failed min channels:       $n_failed_min_channels\n";
-warn "Failed min intensity:      $n_failed_min_int\n";
-warn "Passing spectra:           $n_passed\n";
-warn "----------------------\n\n";
+    /,
+    @reporter_names,
+;
+print $body;
 
 exit;
 
@@ -507,6 +561,17 @@ sub round {
 }
 
 sub process_psm {
+
+    my (
+        $hit_queue,
+        $REP_LOWER,
+        $REP_UPPER,
+        $reporters,
+        $obs_mz,
+        $obs_int,
+        $channel_sums,
+        $spectra,
+    ) = @_;
 
     my $px_parser;
     {
@@ -533,6 +598,10 @@ sub process_psm {
 
         my $scan_id = $query->{spectrumNativeID};
         my $scan_num = $query->{start_scan};
+        if (defined $file_idx) {
+            $scan_num = join ':', $file_idx, $scan_num;
+        }
+            
         my $top = $query->get_hit(0);
 
         #apply early filters
@@ -549,11 +618,17 @@ sub process_psm {
         if (defined $q_cutoff) {
 
             # undefined values are set to 1, as percolator does not output
-            # matches with PEP=1
+            # decoys or matches with PEP=1
+            
             my $qval = $qvals{$scan_num}
                 // $top->{search_score}->{percolator_qvalue}
                 // 1;
 
+            if ($qval == DUP_Q) {
+                lock $n_multiple_hits;
+                ++$n_multiple_hits;
+                next SPECTRUM;
+            }
             if ($qval > $q_cutoff) {
                 lock $n_failed_q_cutoff;
                 ++$n_failed_q_cutoff;
@@ -656,9 +731,9 @@ sub process_psm {
             push @mz_reporter_win,  $mz[$i];
             push @int_reporter_win, $int[$i];
         }
-        my ($rep_mz,$rep_int) = extract_channels($run_idx, \@mz_reporter_win, \@int_reporter_win);
+        my ($rep_mz,$rep_int) = extract_channels($run_idx, \@mz_reporter_win, \@int_reporter_win, $reporters);
 
-        my @values = map {defined $rep_int->{$_->{name}} ? $rep_int->{$_->{name}} : $baseline} @reporters;
+        my @values = map {defined $rep_int->{$_->{name}} ?  $rep_int->{$_->{name}} : $baseline} @{$reporters};
 
         if ($correct_coelute || $max_coelute) {
 
@@ -779,13 +854,13 @@ sub process_psm {
             }
         }
         {
-            lock @channel_sums;
+            lock @$channel_sums;
             for (0..$#values) {
-                    $channel_sums[$_] += $values[$_];
+                    $channel_sums->[$_] += $values[$_];
             }
         }
         {
-            lock @spectra;
+            lock @$spectra;
             my @sp = (
                 $run_idx,
                 $name,
@@ -802,13 +877,15 @@ sub process_psm {
                 @mz_reporter_win,
                 @int_reporter_win,
             );
-            push @spectra, shared_clone([@sp]);
+            push @$spectra, shared_clone([@sp]);
         }
 
     }
 }
 
 sub load_queue  {
+
+    my ($hit_queue) = @_;
 
     my $px_parser;
     {
@@ -840,10 +917,10 @@ sub extract_channels {
     my %rep_mz;
     my %rep_int;
 
-    my ($run, $mz_ref, $int_ref) = @_;
+    my ($run, $mz_ref, $int_ref, $reporters) = @_;
     for my $i (0..$#{$mz_ref}) {
         my $mass = $mz_ref->[$i];
-        for my $tag (@reporters) {
+        for my $tag (@{$reporters}) {
             if ($mass > $tag->{$run}->{lower} && $mass <= $tag->{$run}->{upper}) {
                 my $int = $int_ref->[$i];
                 if (defined $rep_int{$tag->{name}}) {
@@ -893,11 +970,20 @@ sub parse_percolator {
     my @headers = split "\t", $h;
 
     # handle tabular output from percolator or crux-percolator
-    my $col_idx = (first_index {$_ eq 'PSMId'} @headers)
-        // (first_index {$_ eq 'scan'} @headers)
-        // die "Missing expected index column in percolator table";
-    my $col_qval = (first_index {$_ eq 'q-value'} @headers)
-        // die "Missing expected q-value column in percolator table";
+    # Warning - first_index() returns -1 if no match found, not undefined!
+    my $col_idx = (first_index {$_ eq 'PSMId' || $_ eq 'scan'} @headers);
+    die "Missing expected index column in percolator table"
+        if ($col_idx < 0);
+    my $col_qval = (first_index {$_ eq 'q-value' || $_ eq 'percolator q-value'} @headers);
+    die "Missing expected q-value column in percolator table"
+        if ($col_qval < 0);
+    my $col_file = (first_index {$_ eq 'file_idx'} @headers);
+    $col_file = undef if ($col_file < 0);
+
+    # if file index is present, we need the crux percolator log to decode
+    if (defined $col_file && ! defined $fn_perc_log) {
+        die "Multi-file percolator table requires log file param (--perc_log)\n";
+    }
     
     # parse lines
     while (my $line = <$in>) {
@@ -912,13 +998,44 @@ sub parse_percolator {
         elsif ($scan =~ /^(\d+)$/) {
             $scan = $1;
         }
+
+        # crux percolator output can have multiple files included, so we need
+        # to add the file index to decode later
+        if (defined $col_file) {
+            $scan = join ':', $fields[ $col_file ], $scan;
+        }
         else {
             die "Unexpected scan ID format ($scan) in percolator table";
         }
-        $qvals{$scan} = $fields[ $col_qval ];
-    }
 
+        # check for duplicate entries for scan (such as produced by crux
+        # percolator. Assign these a special q-value of '2' -- obviously not a
+        # real q-value but can be checked for and handled specifically and as
+        # a backup will fail a threshold comparison
+        my $q = defined $qvals{$scan} ? DUP_Q : $fields[ $col_qval ];
+        $qvals{$scan} = $q;
+    }
     return %qvals;
 
 }
 
+sub parse_percolator_log {
+
+    my %indices;
+
+    open my $in, '<', $fn_perc_log;
+
+    # parse lines
+    while (my $line = <$in>) {
+        chomp $line;
+        if ($line =~ /^INFO: Assigning index (\d+) to (.+)\.$/) {
+            $indices{$2} = $1;
+        }
+    }
+
+    die "Failed to find file indices in log\n"
+        if (! scalar keys %indices);
+
+    return %indices;
+
+}
