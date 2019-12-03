@@ -1,0 +1,138 @@
+#!/usr/bin/env perl
+
+use strict;
+use warnings;
+use 5.012;
+
+use List::Util qw/sum/;
+use Getopt::Long;
+
+my $fn_pdf;
+my $fix_channels;
+my $plex;
+
+GetOptions(
+    'in=s'         => \$fn_pdf,
+    'fix_channels' => \$fix_channels,
+    'plex=i'       => \$plex,
+);
+
+my %fixed_targets = (
+    10 => {
+        '126'  => [undef, undef, undef,'127C','128C'],
+        '127N' => [undef, undef, undef,'128N','129N'],
+        '127C' => [undef, '126', undef,'128C','129C'],
+        '128N' => [undef, '127N',undef,'129N','130N'],
+        '128C' => ['126', '127C',undef,'129C','130C'],
+        '129N' => ['127N','128N',undef,'130N', '131'],
+        '129C' => ['127C','128C',undef,'130C', undef],
+        '130N' => ['128N','129N',undef, '131', undef],
+        '130C' => ['128C','129C',undef, undef, undef],
+        '131'  => ['129N','130N',undef, undef, undef],
+    },
+    6 => {
+        '126' => [undef, undef, undef, '127', '128'],
+        '127' => [undef, '126', undef, '128', '129'],
+        '128' => ['126', '127', undef, '129', '130'],
+        '129' => ['127', '128', undef, '130', '131'],
+        '130' => ['128', '129', undef, '131', undef],
+        '131' => ['129', '130', undef, undef, undef],
+    }
+);
+
+die "missing or bad PDF name" if (! -r $fn_pdf);
+die "must define --plex" if (! defined $plex);
+
+open my $stream, '-|', 'pdftotext', '-raw', $fn_pdf, '-';
+my @channels;
+my $curr_channel;
+my %interferences;
+my %records;
+my $parse_line = 0;
+
+while (my $line = <$stream>) {
+    next if ($line !~ /\S/);
+    chomp $line;
+
+    if ($line =~ /^TMT$/) {
+        my $tmp = <$stream>;
+        chomp $tmp;
+        $line .= $tmp;
+    }
+    if ($line =~ /^TMT$plex$/) {
+        $parse_line = 1;
+        if (defined $curr_channel) {
+            my $field_count = scalar @{ $records{$curr_channel} };
+            die "unexpected field count: $field_count\n" if ($field_count != 5);
+        }
+    }
+    elsif ($parse_line) {
+        my @parts = split /[\(\s]+/, $line;
+        @parts = grep {defined $_ && (length($_) > 0)} @parts;
+        if ($parts[0] =~ /^-([\dNC]+)$/) {
+            shift @parts;
+            $curr_channel = $1;
+            push @channels, $curr_channel;
+            $records{$curr_channel} = [];
+        }
+        for my $val (@parts) {
+            if ($val =~ /^([\dNC]+)\)$/) {
+                if (! $fix_channels) {
+                    $interferences{$curr_channel}->{$1}
+                        = $records{$curr_channel}->[-1];
+                }
+            }
+            else {
+                $val =~ s/\%$//;
+                die "bad unsigned float: $val" if ($val =~ /[^\d\.]/);
+                push @{$records{$curr_channel}}, $val;
+            }
+        }
+        my $field_count = scalar @{ $records{$curr_channel} };
+        if ($field_count > 6) {
+            warn "too many fields ($field_count)\n";
+            for (@{ $records{$curr_channel} }) {
+                warn "\t$_\n";
+            }
+            exit;
+        }
+        if ($field_count == 6) {
+            shift @{ $records{$curr_channel} };
+        }
+        if ($field_count == 5) {
+            if ($fix_channels) {
+                for (0..4) {
+                    my $target = $fixed_targets{$plex}->{$curr_channel}->[$_];
+                    if (defined $target) {
+                        $interferences{$curr_channel}->{$target}
+                            = $records{$curr_channel}->[$_];
+                    }
+                }
+            }
+            $parse_line = 0;
+        }
+    }
+}
+
+my $field_count = scalar @{ $records{$curr_channel} };
+if ($field_count == 6) {
+    shift @{ $records{$curr_channel} };
+}
+die "unexpected field count: $field_count\n" if ($field_count != 5);
+
+print join("\t", ('',@channels)), "\n";
+for my $channel1 (@channels) {
+    die "unexpected self: $records{$channel1}->[2]\n"
+        if ($records{$channel1}->[2] != 100);
+    my $sum = sum( @{ $records{$channel1} });
+    my @fields = ($channel1);
+    for my $channel2 (@channels) {
+        my $inf = $interferences{$channel1}->{$channel2} // 0;
+        $inf = 100 if ($channel2 eq $channel1);
+        push @fields, $inf/$sum;
+    }
+    print join("\t", @fields), "\n";
+}
+
+    
+
