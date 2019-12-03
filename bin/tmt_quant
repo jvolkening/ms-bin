@@ -14,7 +14,7 @@ use MS::CV qw/:MS/;
 use MS::Mass qw/elem_mass/;
 use Getopt::Long;
 use List::MoreUtils qw/uniq first_index/;
-use List::Util qw/min max sum first any/;
+use List::Util qw/min max sum first any shuffle/;
 use Math::Matrix;
 use threads;
 use threads::shared;
@@ -53,6 +53,7 @@ my $q_cutoff;
 my $fn_perc;
 my $fn_perc_log;
 my $fn_stats;
+my $plot_downsample = 10000;
 
 my @orig_argv = @ARGV;
 
@@ -82,6 +83,7 @@ GetOptions(
     'percolator=s'      => \$fn_perc,
     'perc_log=s'        => \$fn_perc_log,
     'stats=s'           => \$fn_stats,
+    'plot_downsample=i' => \$plot_downsample,
 ) or die "Error parsing options\n";
 
 # load separate percolator table if given
@@ -366,8 +368,13 @@ for my $infile (@pepxml_files) {
             $R->run(q`xhi <- xmax + (xmax-xmin)*.15`);
 
             for (0..$#series) {
-                
-                $R->set('mz', $series[$_]);
+               
+                my @set = @{ $series[$_] };
+                my $n = min(scalar(@set), $plot_downsample);
+                my @use = shuffle(0..$#set);
+                @use = @use[0..$n-1];
+                @set = @set[@use];
+                $R->set('mz', \@set);
                 if ($_ == 0) {
                     $R->run(qq`plot(density(mz),xlim=c(xlo,xhi),main="$name",xlab="",ylab="",lwd=0.5)`);
                 }
@@ -402,6 +409,11 @@ for my $infile (@pepxml_files) {
             my $x_min = min( @lowers, @mz );
             my $x_max = max( @uppers, @mz );
                 
+            my $n = min(scalar(@mz), $plot_downsample);
+            my @use = shuffle(0..$#mz);
+            @use = @use[0..$n-1];
+            @mz = @mz[@use];
+            @int = @int[@use];
 
             $R->set('mz',  \@mz);
             $R->set('int', \@int);
@@ -423,8 +435,8 @@ for my $infile (@pepxml_files) {
 
         }
         $R->run(q`mtext("m/z", side=1, outer=T, at=0.5)`);
-        $R->run(q`mtext("density", side=2, outer=T, at=0.25)`);
-        $R->run(q`mtext("log10 intensity", side=2, outer=T, at=0.75)`);
+        $R->run(q`mtext("density", side=2, outer=T, at=0.75)`);
+        $R->run(q`mtext("log10 intensity", side=2, outer=T, at=0.25)`);
         $R->run(q`dev.off()`);
 
     }    
